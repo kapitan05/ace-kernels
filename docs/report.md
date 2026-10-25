@@ -62,9 +62,12 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy
   (torch.utils.checkpoint). CUDA graphs: `cuda_graph: true` benchmark option.
 - W&B mirror (`--wandb`): results table, config + hypothesis + env, files as
   artifact. Parquet stays the source of truth.
-- Kaggle: `kaggle/sprint2_t4.ipynb` -> `kaggle/run_sprint2.sh` (env check incl.
-  GPU arch in torch build, pytest gate, both configs, profiles, nsys/ncu if present,
-  `results.tgz`).
+- Kaggle from the command line: `python -m ace_bench.remote submit kaggle/run_sprint2.sh`
+  uploads the committed tree as a private dataset, runs `kaggle/run_sprint2.sh` on a
+  T4 (env check incl. GPU arch in torch build, pytest gate, both configs, profiles,
+  nsys/ncu if present) and downloads `results.tgz` to `results/kaggle/<sha>-<job>/`.
+  No secrets on Kaggle; W&B upload happens from the Mac
+  (`python -m ace_bench.tracking results/kaggle/<dir>`).
 - Configs: `baseline_paper.yaml` (paper shapes kits23 / acdc17 / brats21 / amos22,
   hard+soft, fwd+fwd_bwd, 3 impls, CUDA graph rows), `baseline_scaling.yaml`
   (cubes 32^3-192^3), `quick_cpu.yaml` (smoke).
@@ -89,6 +92,5 @@ uv run pytest tests/ -q && uv run ruff check . && uv run mypy
 uv run python -m ace_bench.run bench/configs/quick_cpu.yaml       # look at summary.md + plots
 uv run python -m ace_bench.profile --impl reference --binning soft --shape small
 ```
-Then on Kaggle (GPU T4, internet on; repo pushed to GitHub): run
-`kaggle/sprint2_t4.ipynb`, download `results.tgz`, and I write the baseline
-section from it.
+GPU run: `uv run python -m ace_bench.remote submit kaggle/run_sprint2.sh`, then the
+baseline section is written from `results/kaggle/<sha>-run-sprint2/`.

@@ -9,6 +9,7 @@ impl x binning x shape x mode [x cuda_graph]), ``meta.json`` (config + env) and
 """
 
 import argparse
+import itertools
 import json
 import time
 from datetime import UTC, datetime
@@ -21,7 +22,7 @@ from ace_bench.config import BenchConfig
 from ace_bench.env import REPO_ROOT, collect_env
 from ace_bench.measure import Row, measure_case, release_memory, rows_to_frame
 from ace_bench.report import write_summary
-from ace_bench.tracking import Tracker
+from ace_bench.tracking import mirror_run
 
 
 def _fmt(row: Row) -> str:
@@ -50,50 +51,37 @@ def run(config: BenchConfig, out_root: Path, use_wandb: bool) -> Path:
     print(f"{env.device_name} | torch {env.torch_version} | git {env.git_sha}")
 
     graph_options = [False, True] if config.cuda_graph else [False]
-    rows: list[Row] = []
-    tracker = Tracker(
-        use_wandb,
-        group=config.group,
-        job_type="bench",
-        name=out.name,
-        config={**meta["config"], "env": meta["env"], "hypothesis": config.hypothesis},
-        tags=config.impls,
+    grid = itertools.product(
+        config.shapes, config.binnings, config.impls, config.modes, graph_options
     )
-    with tracker:
-        for shape in config.shapes:
-            for binning in config.binnings:
-                loss_config = config.loss.model_copy(update={"binning": binning})
-                for impl in config.impls:
-                    for mode in config.modes:
-                        for graphed in graph_options:
-                            start = time.perf_counter()
-                            row = measure_case(
-                                impl,
-                                shape,
-                                loss_config,
-                                mode,
-                                env,
-                                cuda_graph=graphed,
-                                warmup=config.warmup,
-                                reps=config.reps,
-                                seed=config.seed,
-                            )
-                            release_memory(config.device)
-                            rows.append(row)
-                            label = f"{shape.name:10s} {binning:4s} {impl:22s} "
-                            label += f"{mode:7s}{' graph' if graphed else '':6s}"
-                            took = time.perf_counter() - start
-                            print(f"{label} {_fmt(row)}  ({took:.1f}s)", flush=True)
-        df = rows_to_frame(rows)
-        df = df.with_columns(pl.lit(out.name).alias("run_id"))
-        df.write_parquet(out / "rows.parquet")
-        summary = write_summary(df, meta, out)
-        tracker.log_table("results", df)
-        tracker.summary({"run_id": out.name, "rows": len(rows)})
-        tracker.log_files(f"bench-{config.name}", "bench-results", [out])
+    rows: list[Row] = []
+    for shape, binning, impl, mode, graphed in grid:
+        loss_config = config.loss.model_copy(update={"binning": binning})
+        start = time.perf_counter()
+        row = measure_case(
+            impl,
+            shape,
+            loss_config,
+            mode,
+            env,
+            cuda_graph=graphed,
+            warmup=config.warmup,
+            reps=config.reps,
+            seed=config.seed,
+        )
+        release_memory(config.device)
+        rows.append(row)
+        label = f"{shape.name:10s} {binning:4s} {impl:22s} "
+        label += f"{mode:7s}{' graph' if graphed else '':6s}"
+        took = time.perf_counter() - start
+        print(f"{label} {_fmt(row)}  ({took:.1f}s)", flush=True)
+
+    df = rows_to_frame(rows).with_columns(pl.lit(out.name).alias("run_id"))
+    df.write_parquet(out / "rows.parquet")
+    summary = write_summary(df, meta, out)
     print(f"\nwrote {out}\n{summary}")
-    if tracker.url:
-        print(f"W&B: {tracker.url}")
+    if use_wandb:
+        print(f"W&B: {mirror_run(out)}")
     return out
 
 

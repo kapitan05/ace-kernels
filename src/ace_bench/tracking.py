@@ -6,6 +6,8 @@ The API key is read by wandb itself from ``WANDB_API_KEY``; it is never passed
 or logged here. Without ``enabled`` every call is a no-op.
 """
 
+import argparse
+import json
 from pathlib import Path
 from types import TracebackType
 from typing import Any
@@ -77,3 +79,40 @@ class Tracker:
     ) -> None:
         if self._run is not None:
             self._run.finish(exit_code=0 if exc_type is None else 1)
+
+
+def mirror_run(run_dir: Path, project: str = "ace-kernels") -> str | None:
+    """Upload one finished benchmark dir (meta.json + rows.parquet) to W&B."""
+    meta = json.loads((run_dir / "meta.json").read_text())
+    df = pl.read_parquet(run_dir / "rows.parquet")
+    config = meta["config"]
+    with Tracker(
+        True,
+        project=project,
+        group=config["group"],
+        job_type="bench",
+        name=meta["run_id"],
+        config={**config, "env": meta["env"]},
+        tags=[*config["impls"], meta["env"]["device_name"]],
+    ) as tracker:
+        tracker.log_table("results", df)
+        tracker.summary({"run_id": meta["run_id"], "rows": df.height})
+        tracker.log_files(f"bench-{config['name']}", "bench-results", [run_dir])
+        return tracker.url
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Mirror benchmark results to W&B (key from `wandb login`)"
+    )
+    parser.add_argument("path", type=Path, help="a run dir, or a dir containing runs")
+    args = parser.parse_args()
+    runs = sorted(p.parent for p in args.path.rglob("meta.json"))
+    if not runs:
+        raise SystemExit(f"no runs (meta.json) under {args.path}")
+    for run_dir in runs:
+        print(f"{run_dir.name}: {mirror_run(run_dir)}")
+
+
+if __name__ == "__main__":
+    main()

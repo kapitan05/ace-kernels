@@ -17,7 +17,7 @@ src/ace_kernels/
 src/ace_bench/       measurement: run.py (benchmarks), profile.py, report.py,
                      calculator.py (bandwidth/launch floors), timing.py, tracking.py (W&B)
 bench/configs/       experiment YAMLs (each states its hypothesis)
-kaggle/              run_sprint2.sh + notebook for Kaggle GPU sessions
+kaggle/              job scripts + entry.py run on Kaggle GPUs via ace_bench.remote
 tests/               correctness gate, parametrized over every registered impl
   golden/            stored reference loss + grad per case
 scripts/make_golden.py
@@ -45,6 +45,9 @@ uv run python -m ace_bench.run bench/configs/quick_cpu.yaml        # pipeline sm
 uv run python -m ace_bench.run bench/configs/baseline_paper.yaml --wandb   # on GPU
 uv run python -m ace_bench.report results/<run_id>                 # rebuild tables/plots
 uv run python -m ace_bench.profile --impl reference --binning soft --shape kits23
+
+uv run python -m ace_bench.remote submit kaggle/run_sprint2.sh     # run on Kaggle T4, fetch results
+uv run python -m ace_bench.tracking results/kaggle/<dir>           # mirror results to W&B
 ```
 
 Benchmark output (`results/<timestamp>-<name>/`, git-ignored): `rows.parquet`
