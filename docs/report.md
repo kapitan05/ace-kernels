@@ -94,3 +94,43 @@ uv run python -m ace_bench.profile --impl reference --binning soft --shape small
 ```
 GPU run: `uv run python -m ace_bench.remote submit kaggle/run_sprint2.sh`, then the
 baseline section is written from `results/kaggle/<sha>-run-sprint2/`.
+
+## Sprint 3: v1, vectorized PyTorch (2026-10-25)
+
+**Done (GPU numbers pending `kaggle/run_sprint3.sh`)**
+- `ace_kernels/common.py`: shared pre/post-processing reproducing the reference
+  (activation, one-hot, background, empty classes, weights, reduction), the
+  bit-identical bin boundaries, and `soft_assign` (reference soft weights).
+- `v1_vectorized`: only the B x C loop removed (flat `[B*C*K]` bins, offset
+  `r*K`); otherwise the reference's ops (one-hot, `scatter_reduce(mean)`, six
+  scatters for soft, boolean-mask NaN fill).
+- `v1_clean`: + plain sums (no `scatter_reduce`), no one-hot for index targets
+  (gather the true-class bin, scatter on `[B, N]`), `torch.where` masking (no host
+  sync; guarded division so empty bins give zero gradient, not NaN).
+- `v1_clean_compile`: `torch.compile(v1_clean)`.
+- Tests: all three pass the 43 golden cases (loss + grad) and the hypothesis
+  equivalence vs reference; 255 CPU tests pass. New CUDA-only `test_sync.py`:
+  v1_clean must run fwd+bwd under `set_sync_debug_mode("error")`; documents that
+  the reference syncs.
+- Experiments: `sprint3_paper.yaml` (ablation on paper shapes, with CUDA-graph
+  rows) and `sprint3_scaling.yaml`; Kaggle job `kaggle/run_sprint3.sh`.
+
+**Findings (device-independent, 2x4x32^3, saved for backward beyond inputs)**
+
+| impl | hard: tensors / bytes | soft: tensors / bytes | CPU fwd+bwd hard / soft (sanity only) |
+|---|---|---|---|
+| reference | 38 / 3.00x | 167 / 11.00x | 9.9 / 16.6 ms |
+| v1_vectorized | 10 / 3.00x | 27 / 11.00x | 7.7 / 9.5 ms |
+| v1_clean | 8 / 3.00x | 31 / 11.75x | 3.1 / ~10 ms |
+
+1. Vectorizing cuts the number of saved tensors 4-6x but not the bytes: default
+   autograd must keep per-voxel tensors (hard: int64 bin index = 2x input + softmax
+   output; soft: interpolation weights and products). The memory fix needs the
+   handwritten backward (Sprint 4), not better PyTorch ops.
+2. A single scatter over concatenated left/right contributions (fewer kernels)
+   made soft memory worse (15.75x): autograd keeps the 2N-sized concatenations.
+   Reverted to per-side scatters. Fewer kernels is not automatically better.
+3. "Small (uint8) bin indices" is not possible in PyTorch: scatter ops require int64
+   indices. Moves to the Triton kernel (Sprint 5).
+4. The index-target path (no one-hot) saves writing a `[B, C, N]` float tensor
+   but autograd keeps its gathered `[B, N]` int64 indices (+0.75x for soft at C=4).

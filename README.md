@@ -11,7 +11,9 @@ src/ace_reference/   frozen upstream losses (correctness oracle, never edited)
 src/ace_kernels/
   config.py          ACEConfig: all loss options (pydantic)
   registry.py        ace_loss(input, target, config, impl=...) + implementation registry
-  impls/             one module per implementation (Sprint 1: reference only)
+  impls/             one module per implementation: reference, baselines
+                     (compile, checkpoint), v1_vectorized, v1_clean(+compile)
+  common.py          shared pre/post-processing, bin boundaries, soft weights
   cases.py           deterministic inputs + named edge cases (shared by tests/bench)
   instrumentation.py bytes saved for backward (saved_tensors_hooks)
 src/ace_bench/       measurement: run.py (benchmarks), profile.py, report.py,

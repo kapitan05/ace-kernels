@@ -1,0 +1,24 @@
+# Sprint 3 ablation on the paper's training shapes. One change per row:
+# reference -> v1_vectorized (loop removed) -> v1_clean (sums, no one-hot,
+# no host sync) -> v1_clean_compile; reference_compile as the off-the-shelf bar.
+name: sprint3-paper
+group: sprint3-v1
+hypothesis: >-
+  Removing the B x C loop cuts kernels per call from O(B*C) to O(1) and gives a
+  large speedup at C=16 (amos22) and small volumes; v1_clean adds a further
+  gain from fewer passes and becomes CUDA-graph capturable (no host sync).
+  Saved-for-backward memory stays ~3x (hard) / ~11x (soft) input size: default
+  autograd keeps per-voxel tensors (fixed in Sprint 4). Both v1 impls remain
+  well below the bandwidth floor.
+device: cuda
+impls: [reference, reference_compile, v1_vectorized, v1_clean, v1_clean_compile]
+binnings: [hard, soft]
+modes: [fwd, fwd_bwd]
+cuda_graph: true
+warmup: 3
+reps: 10
+shapes:
+  - {name: kits23, batch: 2, channels: 4, spatial: [128, 128, 128]}
+  - {name: acdc17, batch: 2, channels: 4, spatial: [256, 256, 16]}
+  - {name: brats21, batch: 2, channels: 4, spatial: [224, 224, 144]}
+  - {name: amos22, batch: 2, channels: 16, spatial: [176, 176, 64]}

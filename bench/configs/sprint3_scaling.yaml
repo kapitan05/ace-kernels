@@ -1,0 +1,20 @@
+# Sprint 3: % of peak bandwidth vs volume size for the v1 implementations.
+name: sprint3-scaling
+group: sprint3-v1
+hypothesis: >-
+  v1 implementations are launch-bound only at the smallest sizes and approach a
+  constant fraction of peak bandwidth as volume grows; the reference stays
+  launch-bound longer because of its B*C kernel launches per call.
+device: cuda
+impls: [reference, v1_vectorized, v1_clean, v1_clean_compile]
+binnings: [hard, soft]
+modes: [fwd_bwd]
+warmup: 3
+reps: 10
+shapes:
+  - {name: cube32, batch: 2, channels: 4, spatial: [32, 32, 32]}
+  - {name: cube64, batch: 2, channels: 4, spatial: [64, 64, 64]}
+  - {name: cube96, batch: 2, channels: 4, spatial: [96, 96, 96]}
+  - {name: cube128, batch: 2, channels: 4, spatial: [128, 128, 128]}
+  - {name: cube160, batch: 2, channels: 4, spatial: [160, 160, 160]}
+  - {name: cube192, batch: 2, channels: 4, spatial: [192, 192, 192]}
