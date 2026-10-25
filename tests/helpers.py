@@ -27,6 +27,25 @@ SMOKE_CASES = frozenset(
     }
 )
 
+# Cases with exact ties: probabilities exactly on edges / constant / 0-1, so some
+# bins have mean(p) - mean(y) == 0 exactly, where |x| has a kink. Eager PyTorch
+# returns the subgradient sign(0) = 0; a compiled kernel reorders the float ops,
+# gets +-1e-9 and returns +-1/N. Both are valid subgradients (measured on a T4:
+# v1_clean_compile, bin-edges-right-hard). For compiled impls these cases check
+# the loss exactly and the gradient only for finiteness.
+TIE_CASES = frozenset(
+    {
+        f"{name}-{b}"
+        for name in (
+            "bin-edges-left",
+            "bin-edges-right",
+            "constant-probs",
+            "extreme-probs",
+        )
+        for b in ("hard", "soft")
+    }
+)
+
 DEVICES = [
     "cpu",
     pytest.param(
