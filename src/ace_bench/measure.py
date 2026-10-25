@@ -196,7 +196,8 @@ def measure_case(
             if device == "cuda":
                 row.kernels_per_call, row.aten_ops_per_call = _count_ops(fn)
                 row.launch_floor_ms = calculator.launch_floor_ms(row.kernels_per_call)
-            row.peak_extra_bytes = _peak_extra_bytes(fn, device)
+            if not cuda_graph:  # replaying a graph allocates nothing: peak meaningless
+                row.peak_extra_bytes = _peak_extra_bytes(fn, device)
             _apply_timing(row, measure(fn, device, warmup=warmup, reps=reps), env)
     except torch.OutOfMemoryError as exc:
         row.status, row.error = "oom", str(exc).splitlines()[0][:500]

@@ -26,6 +26,16 @@ SURFACE, TEXT, TEXT_2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
 MiB = 2**20
 
 
+def _clean(df: pl.DataFrame) -> pl.DataFrame:
+    """Peak memory of a CUDA-graph replay is not meaningful (older runs logged 0)."""
+    return df.with_columns(
+        pl.when(pl.col("cuda_graph"))
+        .then(None)
+        .otherwise(pl.col("peak_extra_bytes"))
+        .alias("peak_extra_bytes")
+    )
+
+
 def _table(df: pl.DataFrame) -> pl.DataFrame:
     """Human-readable columns, one row per shape x impl x cuda_graph."""
     ref = df.filter((pl.col("impl") == "reference") & ~pl.col("cuda_graph")).select(
@@ -92,7 +102,13 @@ def _groups(df: pl.DataFrame) -> list[tuple[str, str, pl.DataFrame]]:
 
 
 def _bar_panel(
-    ax: Any, sub: pl.DataFrame, impls: list[str], column: str, label: str, log: bool
+    ax: Any,
+    sub: pl.DataFrame,
+    impls: list[str],
+    colors: dict[str, str],
+    column: str,
+    label: str,
+    log: bool,
 ) -> None:
     shapes = sub["shape"].unique(maintain_order=True).to_list()
     height = 0.8 / max(1, len(impls))
@@ -111,7 +127,10 @@ def _bar_panel(
                 y,
                 v,
                 height=height - 0.02,
-                color=SERIES[i % len(SERIES)],
+                color=colors[impl],
+                hatch="////" if impl.endswith("+graph") else None,
+                edgecolor=SURFACE,
+                linewidth=0,
                 label=None if labelled else impl,
             )
             labelled = True
@@ -148,6 +167,11 @@ def write_plots(df: pl.DataFrame, impl_order: list[str], out: Path) -> list[Path
         for lbl in (impl, impl + " +graph")
         if lbl in set(ok["label"].to_list())
     ]
+    # colour follows the implementation (config order), never its rank in a chart;
+    # "+graph" rows share their implementation's hue with hatching
+    colors = {}
+    for i, impl in enumerate(impl_order):
+        colors[impl] = colors[impl + " +graph"] = SERIES[i % len(SERIES)]
     paths = []
     panels = [
         ("p50_ms", "Time per call, ms (p50, log)", True),
@@ -171,7 +195,7 @@ def write_plots(df: pl.DataFrame, impl_order: list[str], out: Path) -> list[Path
         )
         for ax, (col, title, log) in zip(axes[0], present, strict=True):
             ax.set_facecolor(SURFACE)
-            _bar_panel(ax, sub, labels, col, title, log)
+            _bar_panel(ax, sub, labels, colors, col, title, log)
         handles, names = axes[0][0].get_legend_handles_labels()
         fig.legend(
             handles,
@@ -205,6 +229,7 @@ def write_summary(df: pl.DataFrame, meta: dict[str, Any], out: Path) -> str:
         f"git {env['git_sha']}{' (dirty)' if env['git_dirty'] else ''}",
         "",
     ]
+    df = _clean(df)
     tex = []
     for binning, mode, sub in _groups(df):
         table = _table(sub)

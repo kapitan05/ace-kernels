@@ -95,6 +95,53 @@ uv run python -m ace_bench.profile --impl reference --binning soft --shape small
 GPU run: `uv run python -m ace_bench.remote submit kaggle/run_sprint2.sh`, then the
 baseline section is written from `results/kaggle/<sha>-run-sprint2/`.
 
+### Sprint 2 baseline results: Tesla T4 (Kaggle), commit fb8ebdc, 2026-10-25
+
+Source: `results/kaggle/fb8ebdca9b33-run-sprint2/` (W&B group `sprint2-baseline`).
+Correctness gate on GPU: 255 passed (all 43 golden cases on CUDA).
+
+Paper shapes, fwd+bwd, p50 ms (bandwidth floor = ideal bytes at 320 GB/s):
+
+| shape | binning | reference | % peak BW | kernels/call | compile | checkpoint | BW floor | saved for bwd | peak extra |
+|---|---|---|---|---|---|---|---|---|---|
+| kits23 2x4x128^3 | hard | 99.4 | 0.84 | 428 | 65.3 (1.5x) | 169 (0.59x) | 0.84 | 192 MiB | 320 MiB |
+| kits23 | soft | 180 | 0.47 | 981 | 38.1 (4.7x) | 279 (0.65x) | 0.84 | 704 MiB | 864 MiB |
+| brats21 2x4x224^2x144 | hard | 353 | 0.82 | 428 | 241 (1.5x) | 587 | 2.89 | 662 MiB | 1106 MiB |
+| brats21 | soft | 606 | 0.48 | 981 | 150 (4.0x) | 941 | 2.89 | 2.4 GiB | 3.0 GiB |
+| amos22 2x16x176^2x64 | hard | 801 | 0.32 | 1604 | 528 (1.5x) | 1287 | 2.58 | 726 MiB | 1.3 GiB |
+| amos22 | soft | 1491 | 0.17 | 3813 | **2894 (0.52x)** | 2118 | 2.58 | 2.6 GiB | 3.4 GiB |
+
+Where the GPU time goes (torch.profiler traces, kits23 fwd+bwd):
+
+| impl | GPU ms/step | scatter/gather kernels | other |
+|---|---|---|---|
+| reference hard | 97 | **84%** | 16% elementwise |
+| reference soft | 167 | 51% | 48% elementwise (soft-weight temporaries) |
+| compile hard | 65 | **85%** | 14% fused Triton |
+| compile soft | 40 | 43% | 57% fused Triton |
+
+**Findings**
+1. The reference reaches 0.2-0.8% of peak bandwidth: 100-500x above the floor.
+2. It is **not launch-bound**: launch floor (kernels x 5 us) is 2-19 ms vs 100-1500 ms
+   measured, and CUDA-graph replay changes nothing for hard binning (99.4 -> 99.4 ms).
+3. The bottleneck is **atomic contention in scatter_add/scatter_reduce**: millions of
+   voxels add into 20 bin addresses per (b, c), so atomics serialize (84% of GPU time
+   for hard). Matches the meeting note "replace scatter_add with tiling". Fix:
+   per-block private histograms, one atomic per bin per block (Triton, Sprint 5).
+4. torch.compile: 1.5x (hard) / 4-4.7x (soft), still ~2% of peak; it keeps the
+   scatter atomics. With 16 classes (amos22) compile is **2x slower** than eager.
+5. The reference soft loss cannot be captured in a CUDA graph: `torch.tensor` sentinels
+   inside the loss are host->device copies (hard and compile capture fine).
+6. Memory: soft keeps 11x the input for backward (2.4 GiB at BraTS size). Checkpoint
+   keeps 0 extra but its **peak is unchanged** (the backward recomputes everything at
+   once) and it costs 1.5-1.7x time: no free lunch from off-the-shelf recomputation.
+7. Kaggle limits: `nsys` not installed; `ncu` blocked (`ERR_NVGPUCTRPERM`, no access
+   to GPU performance counters). Kernel-level counters need another GPU host.
+
+**Consequence for Sprint 3**: v1_vectorized / v1_clean still scatter into few bins per
+slice, so contention remains; expect modest gains, not the floor. Their GPU run tells
+how much is loop/sync overhead vs contention.
+
 ## Sprint 3: v1, vectorized PyTorch (2026-10-25)
 
 **Done (GPU numbers pending `kaggle/run_sprint3.sh`)**
