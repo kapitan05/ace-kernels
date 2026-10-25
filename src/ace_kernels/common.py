@@ -5,7 +5,10 @@ activation, optional one-hot target, background removal, empty-class masking,
 class weights and reduction. Only the binning in between differs per impl.
 """
 
+import functools
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 
@@ -14,15 +17,31 @@ from ace_kernels.config import ACEConfig
 EPS32 = torch.finfo(torch.float32).eps
 
 
+# Boundaries are part of the loss definition: values exactly on an edge must land
+# in the same bin as in the reference. They are built eagerly and cached, outside
+# any torch.compile graph: under compile on CUDA (T4), exact-edge values landed in
+# the neighbouring bin (suspected cause: Inductor-generated linspace, ~1 ulp off).
+def _eager[F: Callable[..., torch.Tensor]](fn: F) -> F:
+    """Typed ``torch.compiler.disable``: always run ``fn`` outside compiled graphs."""
+    # torch ships torch.compiler.disable unannotated
+    return cast(F, torch.compiler.disable(fn))  # type: ignore[no-untyped-call]
+
+
+@functools.cache
+def _linspace_cached(steps: int, device: torch.device) -> torch.Tensor:
+    return torch.linspace(0.0, 1.0 + EPS32, steps, device=device)
+
+
+@_eager
 def hard_edges(num_bins: int, device: torch.device) -> torch.Tensor:
     """Upper bin edges, bit-identical to the reference (float32 linspace)."""
-    edges = torch.linspace(0.0, 1.0 + EPS32, num_bins + 1, device=device)
-    return edges[1:]
+    return _linspace_cached(num_bins + 1, torch.device(device))[1:]
 
 
+@_eager
 def soft_half_boundaries(num_bins: int, device: torch.device) -> torch.Tensor:
     """Bin centres and edges interleaved, bit-identical to the reference."""
-    return torch.linspace(0.0, 1.0 + EPS32, 2 * num_bins + 1, device=device)
+    return _linspace_cached(2 * num_bins + 1, torch.device(device))
 
 
 @dataclass

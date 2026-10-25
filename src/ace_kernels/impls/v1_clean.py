@@ -7,9 +7,10 @@ Changes on top of v1_vectorized, each removing memory traffic or a host sync:
 - With an index target (``to_onehot_y``) no one-hot tensor is built: each voxel
   adds its bin weight only to the row of its true class (gather + scatter on
   ``[B, N]`` instead of ``[B, C, N]``).
-- Empty bins are masked with ``torch.where`` (no boolean-index assignment, so no
-  device -> host synchronization); divisions are guarded so empty bins give zero,
-  not NaN, gradients.
+- Empty bins are masked with ``torch.where`` instead of boolean-index assignment;
+  divisions are guarded so empty bins give zero, not NaN, gradients. No
+  host<->device copies or syncs anywhere, so fwd+bwd is CUDA-graph capturable
+  (tests/test_sync.py).
 """
 
 import torch

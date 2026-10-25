@@ -1,7 +1,7 @@
-"""Host-device synchronization: v1_clean must never block the CPU on the GPU.
+"""Host<->device traffic: v1_clean must never sync or copy between CPU and GPU.
 
-A sync inside the loss stalls the training step's CPU-side kernel queueing and
-breaks CUDA-graph capture. Runs only with CUDA.
+A sync stalls the training step's CPU-side kernel queueing; syncs and
+host->device copies break CUDA-graph capture. Runs only with CUDA.
 """
 
 import pytest
@@ -40,17 +40,20 @@ def test_v1_clean_has_no_host_sync(binning: str, include_background: bool) -> No
     assert torch.isfinite(grad).all()
 
 
-def test_reference_does_sync() -> None:
-    """Documents the baseline: the reference's boolean-mask NaN fill syncs."""
-    config = ACEConfig(to_onehot_y=True)
+def test_reference_soft_is_not_graph_capturable() -> None:
+    """Documents the baseline: the reference soft loss builds its sentinels with
+    ``torch.tensor(..., device=cuda)``, a host->device copy that CUDA-graph capture
+    rejects. (Its boolean-mask NaN fill does *not* sync on CUDA: measured.)"""
+    config = ACEConfig(binning="soft", to_onehot_y=True)
     x, y = make_inputs(InputSpec(1, 2, (8, 8, 8)), config, "cuda")
+    ace_loss(x, y, config, impl="reference")
     torch.cuda.synchronize()
-    torch.cuda.set_sync_debug_mode("error")
-    try:
-        with pytest.raises(RuntimeError, match="synchroniz"):
-            ace_loss(x, y, config, impl="reference")
-    finally:
-        torch.cuda.set_sync_debug_mode("default")
+    graph = torch.cuda.CUDAGraph()
+    with (
+        pytest.raises(RuntimeError, match="CUDA graph capture"),
+        torch.cuda.graph(graph),
+    ):
+        ace_loss(x, y, config, impl="reference")
 
 
 @pytest.mark.parametrize("binning", ["hard", "soft"])
