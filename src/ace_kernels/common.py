@@ -44,7 +44,9 @@ def soft_assign(p: torch.Tensor, num_bins: int, right: bool) -> SoftAssignment:
     half_idx = torch.bucketize(p, half[1:], right=right)
     left_idx = torch.clamp(half_idx - 1, min=0) // 2
     right_idx = torch.clamp(half_idx + 1, max=2 * num_bins - 1) // 2
-    sentinel = torch.tensor([10000.0], device=p.device)
+    # sentinels made on the device (torch.tensor would be a host->device copy,
+    # which breaks CUDA-graph capture)
+    sentinel = half.new_full((1,), 10000.0)
     repl = torch.cat((-sentinel, half[1::2].repeat_interleave(2), sentinel))
     left_dist = p - repl[half_idx]
     right_dist = repl[half_idx + 2] - p
@@ -156,7 +158,8 @@ def finalize(
             raise ValueError(
                 "the value/values of the `weight` should be no less than 0."
             )
-        f = f * torch.tensor(weights, dtype=f.dtype, device=f.device)
+        # per-class Python scalars: no host->device copy (CUDA-graph capturable)
+        f = torch.cat([f[:, i : i + 1] * w for i, w in enumerate(weights)], dim=1)
     if config.reduction == "mean":
         return f.mean()
     if config.reduction == "sum":

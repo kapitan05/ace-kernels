@@ -52,7 +52,7 @@ follow_imports = "skip"
 
 [[tool.mypy.overrides]]
 # torch's CUDA event/stream/NVTX/profiler-control APIs ship without annotations
-module = ["ace_bench.*"]
+module = ["ace_bench.*", "tests.test_sync"]
 disallow_untyped_calls = false
 
 [[tool.mypy.overrides]]

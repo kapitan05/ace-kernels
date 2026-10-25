@@ -51,3 +51,30 @@ def test_reference_does_sync() -> None:
             ace_loss(x, y, config, impl="reference")
     finally:
         torch.cuda.set_sync_debug_mode("default")
+
+
+@pytest.mark.parametrize("binning", ["hard", "soft"])
+def test_v1_clean_captures_in_cuda_graph(binning: str) -> None:
+    """No host<->device copies or syncs: fwd+bwd can be captured and replayed."""
+    config = ACEConfig.model_validate(
+        {"binning": binning, "to_onehot_y": True, "weight": (1.0, 2.0, 0.5, 1.0)}
+    )
+    x, y = make_inputs(InputSpec(2, 4, (16, 16, 16)), config, "cuda")
+    x.requires_grad_(True)
+
+    def step() -> torch.Tensor:
+        (grad,) = torch.autograd.grad(ace_loss(x, y, config, impl="v1_clean"), x)
+        return grad
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            expected = step()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = step()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured, expected)
