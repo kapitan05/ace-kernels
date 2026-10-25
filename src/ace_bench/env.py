@@ -77,6 +77,9 @@ def collect_env(device: str) -> EnvInfo:
         name, sm_count, driver = platform.processor() or platform.machine(), None, None
     status = _run(["git", "status", "--porcelain", "--untracked-files=no"])
     sha = _run(["git", "rev-parse", "HEAD"])
+    commit_file = REPO_ROOT / "COMMIT"  # written into remote (Kaggle) snapshots
+    if sha is None and commit_file.exists():
+        sha, status = commit_file.read_text().strip(), ""
     return EnvInfo(
         device=device,
         device_name=name,
