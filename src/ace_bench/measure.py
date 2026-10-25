@@ -54,6 +54,10 @@ class Row(BaseModel):
     aten_ops_per_call: int | None = None
     saved_extra_bytes: int | None = None
     peak_extra_bytes: int | None = None
+    # CUDA memory still allocated after the row and its cleanup: should stay at
+    # the baseline; growth across rows means a leak (Sprint 3 run 4 lost 38 rows
+    # to ~10 GiB leaked from earlier rows).
+    allocated_after_bytes: int | None = None
 
 
 _POLARS_TYPES: dict[str, type[pl.DataType]] = {

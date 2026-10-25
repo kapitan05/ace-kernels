@@ -28,6 +28,8 @@ MiB = 2**20
 
 def _clean(df: pl.DataFrame) -> pl.DataFrame:
     """Peak memory of a CUDA-graph replay is not meaningful (older runs logged 0)."""
+    if "allocated_after_bytes" not in df.columns:  # runs before the leak check
+        df = df.with_columns(pl.lit(None, pl.Int64).alias("allocated_after_bytes"))
     return df.with_columns(
         pl.when(pl.col("cuda_graph"))
         .then(None)
@@ -58,6 +60,7 @@ def _table(df: pl.DataFrame) -> pl.DataFrame:
         pl.col("launch_floor_ms").round(3).alias("launch floor ms"),
         (pl.col("saved_extra_bytes") / MiB).round(1).alias("saved MiB"),
         (pl.col("peak_extra_bytes") / MiB).round(1).alias("peak MiB"),
+        (pl.col("allocated_after_bytes") / MiB).round(1).alias("left allocated MiB"),
     )
 
 

@@ -11,6 +11,7 @@ from ace_bench.config import BenchConfig, ShapeSpec
 from ace_bench.env import REPO_ROOT, collect_env, peak_bandwidth_gbps
 from ace_bench.measure import Row, measure_case, rows_to_frame
 from ace_bench.report import write_summary
+from ace_bench.run import Job, run_isolated
 from ace_bench.timing import measure
 from ace_kernels import ACEConfig, get_impl
 
@@ -125,3 +126,32 @@ def test_report_writes_tables_and_plots(tmp_path: Path) -> None:
         "hard-fwd_bwd.png",
         "soft-fwd_bwd.png",
     ]
+
+
+def _job(impl: str) -> Job:
+    config = BenchConfig(
+        name="t",
+        group="g",
+        hypothesis="h",
+        device="cpu",
+        impls=[impl],
+        modes=["fwd"],
+        shapes=[TINY],
+        warmup=0,
+        reps=1,
+    )
+    return Job(
+        config=config, env=collect_env("cpu"), shape=TINY, binning="hard", impl=impl
+    )
+
+
+def test_isolated_group_returns_rows() -> None:
+    rows = run_isolated(_job("reference"))
+    assert [r.status for r in rows] == ["ok"]
+    assert rows[0].p50_ms is not None
+
+
+def test_crashed_worker_becomes_error_rows() -> None:
+    rows = run_isolated(_job("does_not_exist"))  # KeyError in the worker
+    assert [r.status for r in rows] == ["error"]
+    assert "worker exited" in (rows[0].error or "")
