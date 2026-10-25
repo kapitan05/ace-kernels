@@ -29,7 +29,7 @@ from ace_bench.env import REPO_ROOT
 
 DATASET_SLUG = "ace-kernels-src"
 ACCELERATOR = "NvidiaTeslaT4"
-DONE = {"complete", "error", "cancelacknowledged", "cancelrequested"}
+DONE = {"complete", "error", "cancel_requested", "cancel_acknowledged"}
 
 
 def _kaggle(*args: str, check: bool = True) -> str:
@@ -121,7 +121,9 @@ def push_kernel(user: str, script: Path) -> str:
 
 
 def status(kid: str) -> str:
-    match = re.search(r'status "?([A-Za-z]+)', _kaggle("kernels", "status", kid))
+    # e.g. 'has status "KernelWorkerStatus.RUNNING"' (older CLIs: 'status "running"')
+    out = _kaggle("kernels", "status", kid)
+    match = re.search(r'status "?(?:KernelWorkerStatus\.)?([A-Za-z_]+)', out)
     return match.group(1).lower() if match else "unknown"
 
 
