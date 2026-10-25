@@ -43,6 +43,7 @@ def random_case(draw: st.DrawFn) -> tuple[InputSpec, ACEConfig]:
 @settings(
     max_examples=40,
     deadline=None,
+    derandomize=True,  # same examples every run: the gate must be reproducible
     suppress_health_check=[HealthCheck.function_scoped_fixture],
 )
 @given(case=random_case())

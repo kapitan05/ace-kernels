@@ -14,6 +14,11 @@ from ace_kernels.config import Binning
 # expected; the reference itself agrees with the float64 oracle to ~1e-6.
 LOSS_RTOL, LOSS_ATOL = 1e-5, 1e-6
 GRAD_RTOL, GRAD_ATOL = 1e-4, 1e-7
+# GPU vs CPU-golden gradients: CUDA sums in a different order (atomics, its own
+# softmax). With few voxels per bin the soft gradient's two nearly cancelling
+# terms amplify ~1e-7 rounding ~1000x (measured on a T4: 3 voxels, 5 classes,
+# rel. diff 3.5e-4). Still far below any real bug (mutants were off by >= 1%).
+CUDA_GRAD_RTOL, CUDA_GRAD_ATOL = 1e-3, 1e-6
 
 # Cases run for implementations marked ``slow`` (e.g. torch.compile recompiles
 # for every new shape): the paper setting plus the most fragile edge cases.
@@ -82,11 +87,12 @@ def assert_same(actual: Result, expected: Result) -> None:
         rtol=LOSS_RTOL,
         atol=LOSS_ATOL,
     )
+    on_cuda = actual.grad.device.type == "cuda"
     torch.testing.assert_close(
         actual.grad,
         expected.grad.to(actual.grad.device),
-        rtol=GRAD_RTOL,
-        atol=GRAD_ATOL,
+        rtol=CUDA_GRAD_RTOL if on_cuda else GRAD_RTOL,
+        atol=CUDA_GRAD_ATOL if on_cuda else GRAD_ATOL,
     )
 
 
