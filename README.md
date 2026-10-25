@@ -14,6 +14,10 @@ src/ace_kernels/
   impls/             one module per implementation (Sprint 1: reference only)
   cases.py           deterministic inputs + named edge cases (shared by tests/bench)
   instrumentation.py bytes saved for backward (saved_tensors_hooks)
+src/ace_bench/       measurement: run.py (benchmarks), profile.py, report.py,
+                     calculator.py (bandwidth/launch floors), timing.py, tracking.py (W&B)
+bench/configs/       experiment YAMLs (each states its hypothesis)
+kaggle/              run_sprint2.sh + notebook for Kaggle GPU sessions
 tests/               correctness gate, parametrized over every registered impl
   golden/            stored reference loss + grad per case
 scripts/make_golden.py
@@ -36,7 +40,21 @@ uv run pytest tests/                       # correctness gate (CUDA tests skip w
 uv run ruff check . && uv run ruff format --check .
 uv run mypy
 uv run python scripts/make_golden.py       # only on purpose: regenerates golden file
+
+uv run python -m ace_bench.run bench/configs/quick_cpu.yaml        # pipeline smoke test
+uv run python -m ace_bench.run bench/configs/baseline_paper.yaml --wandb   # on GPU
+uv run python -m ace_bench.report results/<run_id>                 # rebuild tables/plots
+uv run python -m ace_bench.profile --impl reference --binning soft --shape kits23
 ```
+
+Benchmark output (`results/<timestamp>-<name>/`, git-ignored): `rows.parquet`
+(source of truth), `meta.json` (config, hypothesis, env, git sha), `summary.md`,
+`summary.tex`, `plots/`. With `--wandb` the same rows, config and files are
+mirrored to W&B (`WANDB_API_KEY` from the environment, never logged).
+
+Metrics per row: p50/p20/p80 ms, effective GB/s and % of peak DRAM bandwidth
+(ideal bytes / time), bandwidth floor and launch floor (kernels x 5 us), CUDA
+kernels per call, bytes saved for backward beyond the inputs, peak extra memory.
 
 ## Adding an implementation
 

@@ -1,0 +1,13 @@
+# Smoke test of the pipeline on CPU (Mac). Numbers are NOT performance results.
+name: quick-cpu
+group: sprint2-smoke
+hypothesis: "Pipeline produces rows, parquet, tables and plots for every impl."
+device: cpu
+impls: [reference, reference_compile, reference_checkpoint]
+binnings: [hard, soft]
+modes: [fwd, fwd_bwd]
+warmup: 1
+reps: 3
+shapes:
+  - {name: tiny, batch: 2, channels: 4, spatial: [16, 16, 16]}
+  - {name: small, batch: 2, channels: 4, spatial: [32, 32, 32]}

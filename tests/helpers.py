@@ -6,13 +6,26 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from ace_kernels import ACEConfig, ace_loss
+from ace_kernels import ACEConfig, ace_loss, get_impl
+from ace_kernels.config import Binning
 
 # fp32 tolerances for "same loss" between implementations. Summation order
 # differs between implementations (and atomics on GPU), so exact equality is not
 # expected; the reference itself agrees with the float64 oracle to ~1e-6.
 LOSS_RTOL, LOSS_ATOL = 1e-5, 1e-6
 GRAD_RTOL, GRAD_ATOL = 1e-4, 1e-7
+
+# Cases run for implementations marked ``slow`` (e.g. torch.compile recompiles
+# for every new shape): the paper setting plus the most fragile edge cases.
+SMOKE_CASES = frozenset(
+    {
+        "paper-3d-hard",
+        "paper-3d-soft",
+        "empty-class-ignored-hard",
+        "bin-edges-right-hard",
+        "reduction-none-soft",
+    }
+)
 
 DEVICES = [
     "cpu",
@@ -56,3 +69,14 @@ def assert_same(actual: Result, expected: Result) -> None:
         rtol=GRAD_RTOL,
         atol=GRAD_ATOL,
     )
+
+
+def skip_unless_supported(
+    impl: str, binning: Binning, device: str, case_name: str | None = None
+) -> None:
+    """Skip the current test if ``impl`` cannot or should not run this case."""
+    spec = get_impl(impl)
+    if not spec.supports(binning, device):
+        pytest.skip(f"{impl} does not support {binning} on {device}")
+    if spec.slow and (case_name is None or case_name not in SMOKE_CASES):
+        pytest.skip(f"{impl} is slow: smoke cases only")

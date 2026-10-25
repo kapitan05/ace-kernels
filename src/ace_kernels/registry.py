@@ -26,6 +26,7 @@ class ImplSpec:
     binnings: frozenset[Binning]
     devices: frozenset[str]
     description: str
+    slow: bool = False  # e.g. torch.compile: tests run only a small case subset
 
     def supports(self, binning: Binning, device: str) -> bool:
         return binning in self.binnings and device in self.devices
@@ -40,13 +41,14 @@ def register(
     description: str,
     binnings: frozenset[Binning] = ALL_BINNINGS,
     devices: frozenset[str] = ALL_DEVICES,
+    slow: bool = False,
 ) -> Callable[[ACEFn], ACEFn]:
     """Decorator adding an implementation to the registry under ``name``."""
 
     def decorator(fn: ACEFn) -> ACEFn:
         if name in _REGISTRY:
             raise ValueError(f"implementation {name!r} already registered")
-        _REGISTRY[name] = ImplSpec(name, fn, binnings, devices, description)
+        _REGISTRY[name] = ImplSpec(name, fn, binnings, devices, description, slow)
         return fn
 
     return decorator

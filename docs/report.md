@@ -44,3 +44,51 @@ uv sync
 uv run pytest tests/ -v
 uv run ruff check . && uv run ruff format --check . && uv run mypy
 ```
+
+## Sprint 2: Measurement infrastructure (2026-10-25)
+
+**Done (infrastructure; GPU numbers pending the Kaggle run)**
+- `ace_bench.run`: YAML experiment (hypothesis + grid) -> one row per
+  impl x binning x shape x mode [x CUDA graph]: p50/p20/p80 ms (CUDA events, L2
+  flushed per rep, warmup), effective GB/s and % peak BW, bandwidth floor, kernels
+  per call + launch floor, saved-for-backward bytes beyond inputs, peak extra
+  memory; OOM / errors / failed graph capture recorded as row status.
+  Output: parquet + meta.json (env, git sha) + markdown/LaTeX tables + plots.
+- `ace_bench.profile`: torch.profiler trace (Perfetto), op table, saved tensors,
+  CUDA memory snapshot (memory_viz), `torch._dynamo.explain`, `--nsys` mode
+  (NVTX ranges + cudaProfilerApi capture range).
+- Baselines registered as impls (so they are correctness-tested):
+  `reference_compile` (torch.compile), `reference_checkpoint`
+  (torch.utils.checkpoint). CUDA graphs: `cuda_graph: true` benchmark option.
+- W&B mirror (`--wandb`): results table, config + hypothesis + env, files as
+  artifact. Parquet stays the source of truth.
+- Kaggle: `kaggle/sprint2_t4.ipynb` -> `kaggle/run_sprint2.sh` (env check incl.
+  GPU arch in torch build, pytest gate, both configs, profiles, nsys/ncu if present,
+  `results.tgz`).
+- Configs: `baseline_paper.yaml` (paper shapes kits23 / acdc17 / brats21 / amos22,
+  hard+soft, fwd+fwd_bwd, 3 impls, CUDA graph rows), `baseline_scaling.yaml`
+  (cubes 32^3-192^3), `quick_cpu.yaml` (smoke).
+- Tests: 162 pass on CPU (bench pipeline, configs valid, baselines vs golden).
+
+**Findings so far (device-independent, measured on CPU)**
+1. `torch.compile` traces the reference with 0 graph breaks (Dynamo unrolls the
+   B x C loop), so compile is a real baseline, not a strawman.
+2. Saved for backward (2x4x32^3, soft): 167 tensors, 11x the input size; hard: 3x.
+   `reference_checkpoint` saves 0 extra bytes but costs ~1.6-2.4x time (CPU).
+   This is the memory problem behind the paper's "reduce patch for softl1ace to
+   prevent CUDA OOM".
+
+**Incident**: `ruff --fix/format` ran over the untracked upstream clone in the repo
+dir (`Average-Calibration-Losses/`, 44 files). Verified every change was
+ruff-only (HEAD + same ruff == working copy), then restored with `git checkout`.
+Ruff is now limited to `src/`, `tests/`, `scripts/`.
+
+**Verify**
+```
+uv run pytest tests/ -q && uv run ruff check . && uv run mypy
+uv run python -m ace_bench.run bench/configs/quick_cpu.yaml       # look at summary.md + plots
+uv run python -m ace_bench.profile --impl reference --binning soft --shape small
+```
+Then on Kaggle (GPU T4, internet on; repo pushed to GitHub): run
+`kaggle/sprint2_t4.ipynb`, download `results.tgz`, and I write the baseline
+section from it.

@@ -1,0 +1,20 @@
+# Sprint 2 baseline on the paper's training shapes (batch 2, upstream data configs).
+name: baseline-paper
+group: sprint2-baseline
+hypothesis: >-
+  The reference is far below the bandwidth floor (launch-bound and doing extra
+  traffic), and soft binning keeps ~10x the input size for backward.
+  torch.compile helps but does not reach the floor; checkpoint trades time for
+  memory; the reference cannot be captured in a CUDA graph (host sync).
+device: cuda
+impls: [reference, reference_compile, reference_checkpoint]
+binnings: [hard, soft]
+modes: [fwd, fwd_bwd]
+cuda_graph: true
+warmup: 3
+reps: 10
+shapes:
+  - {name: kits23, batch: 2, channels: 4, spatial: [128, 128, 128]}
+  - {name: acdc17, batch: 2, channels: 4, spatial: [256, 256, 16]}
+  - {name: brats21, batch: 2, channels: 4, spatial: [224, 224, 144]}
+  - {name: amos22, batch: 2, channels: 16, spatial: [176, 176, 64]}

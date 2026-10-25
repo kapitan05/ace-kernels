@@ -1,0 +1,19 @@
+# Sprint 2 baseline: how time and memory scale with volume size (GB/s vs voxels).
+name: baseline-scaling
+group: sprint2-baseline
+hypothesis: >-
+  Reference time grows with voxels but % of peak bandwidth stays low at every
+  size; at small sizes the launch floor (B*C loop) dominates.
+device: cuda
+impls: [reference, reference_compile]
+binnings: [hard, soft]
+modes: [fwd_bwd]
+warmup: 3
+reps: 10
+shapes:
+  - {name: cube32, batch: 2, channels: 4, spatial: [32, 32, 32]}
+  - {name: cube64, batch: 2, channels: 4, spatial: [64, 64, 64]}
+  - {name: cube96, batch: 2, channels: 4, spatial: [96, 96, 96]}
+  - {name: cube128, batch: 2, channels: 4, spatial: [128, 128, 128]}
+  - {name: cube160, batch: 2, channels: 4, spatial: [160, 160, 160]}
+  - {name: cube192, batch: 2, channels: 4, spatial: [192, 192, 192]}

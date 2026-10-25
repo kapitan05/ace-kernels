@@ -11,7 +11,7 @@ from hypothesis import strategies as st
 
 from ace_kernels import ACEConfig, available_impls
 from ace_kernels.cases import InputSpec, make_inputs
-from tests.helpers import DEVICES, assert_same, run
+from tests.helpers import DEVICES, assert_same, run, skip_unless_supported
 
 
 @st.composite
@@ -50,9 +50,7 @@ def test_impl_matches_reference(
     impl: str, device: str, case: tuple[InputSpec, ACEConfig]
 ) -> None:
     spec, config = case
-    impl_spec = next(s for s in available_impls() if s.name == impl)
-    if not impl_spec.supports(config.binning, device):
-        pytest.skip(f"{impl} does not support {config.binning} on {device}")
+    skip_unless_supported(impl, config.binning, device)
     x, y = make_inputs(spec, config, device)
     expected = run("reference", x.cpu(), y.cpu(), config)
     assert_same(run(impl, x, y, config), expected)

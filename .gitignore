@@ -5,5 +5,10 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .hypothesis/
-results/tmp/
 *.egg-info/
+results/
+results.tgz
+*.nsys-rep
+*.ncu-rep
+.env
+wandb/
