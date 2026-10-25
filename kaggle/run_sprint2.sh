@@ -61,4 +61,4 @@ else
 fi
 
 tar czf results.tgz results
-echo "== Done: results.tgz (download from the notebook output)"
+echo "== Done: results.tgz"
