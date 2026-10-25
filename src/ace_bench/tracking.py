@@ -8,6 +8,7 @@ or logged here. Without ``enabled`` every call is a no-op.
 
 import argparse
 import json
+from html import escape
 from pathlib import Path
 from types import TracebackType
 from typing import Any
@@ -57,6 +58,17 @@ class Tracker:
         if self._run is not None:
             self._run.summary.update(values)
 
+    def log_images(self, paths: list[Path], prefix: str = "plots") -> None:
+        if self._run is None or not paths:
+            return
+        self._run.log({f"{prefix}/{p.stem}": self._wandb.Image(str(p)) for p in paths})
+
+    def log_text(self, key: str, path: Path) -> None:
+        """Show a text file (op table, saved tensors, log tail) on the run page."""
+        if self._run is not None and path.exists():
+            text = path.read_text(errors="replace")[-100_000:]
+            self._run.log({key: self._wandb.Html(f"<pre>{escape(text)}</pre>")})
+
     def log_files(self, name: str, kind: str, paths: list[Path]) -> None:
         if self._run is None:
             return
@@ -96,8 +108,34 @@ def mirror_run(run_dir: Path, project: str = "ace-kernels") -> str | None:
         tags=[*config["impls"], meta["env"]["device_name"]],
     ) as tracker:
         tracker.log_table("results", df)
+        tracker.log_images(sorted((run_dir / "plots").glob("*.png")))
         tracker.summary({"run_id": meta["run_id"], "rows": df.height})
         tracker.log_files(f"bench-{config['name']}", "bench-results", [run_dir])
+        return tracker.url
+
+
+def mirror_profiles(
+    root: Path, group: str, logs: list[Path], project: str = "ace-kernels"
+) -> str | None:
+    """One W&B run holding every profile dir under ``root`` (+ job logs)."""
+    profile_dirs = sorted(p.parent for p in root.rglob("ops.txt"))
+    nsys = sorted(root.rglob("nsys"))
+    with Tracker(
+        True,
+        project=project,
+        group=group,
+        job_type="profile",
+        name=f"profiles-{root.name}",
+        config={"profiles": [d.name for d in profile_dirs]},
+        tags=["profile"],
+    ) as tracker:
+        for d in profile_dirs:
+            tracker.log_text(f"{d.name}/ops", d / "ops.txt")
+            tracker.log_text(f"{d.name}/saved_tensors", d / "saved_tensors.txt")
+            tracker.log_text(f"{d.name}/dynamo_explain", d / "dynamo_explain.txt")
+        for log in logs:
+            tracker.log_text(f"logs/{log.stem}", log)
+        tracker.log_files("profiles", "profile", [*profile_dirs, *nsys, *logs])
         return tracker.url
 
 
@@ -108,10 +146,17 @@ def main() -> None:
     parser.add_argument("path", type=Path, help="a run dir, or a dir containing runs")
     args = parser.parse_args()
     runs = sorted(p.parent for p in args.path.rglob("meta.json"))
-    if not runs:
-        raise SystemExit(f"no runs (meta.json) under {args.path}")
+    has_profiles = any(args.path.rglob("ops.txt"))
+    if not runs and not has_profiles:
+        raise SystemExit(f"no runs (meta.json) or profiles (ops.txt) under {args.path}")
+    groups = set()
     for run_dir in runs:
+        groups.add(json.loads((run_dir / "meta.json").read_text())["config"]["group"])
         print(f"{run_dir.name}: {mirror_run(run_dir)}")
+    if has_profiles:
+        group = groups.pop() if len(groups) == 1 else "profiles"
+        logs = sorted(args.path.glob("*.log"))
+        print(f"profiles: {mirror_profiles(args.path, group, logs)}")
 
 
 if __name__ == "__main__":
