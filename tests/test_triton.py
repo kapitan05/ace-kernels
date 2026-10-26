@@ -289,7 +289,9 @@ def test_v5_matches_v4(binning: str, name: str, spatial: tuple[int, ...]) -> Non
     bad_voxels = mismatch.any(1)
     near = _near_boundary_voxels(x, config)
     assert not (bad_voxels & ~near).any(), "gradient differs away from bin boundaries"
-    assert near.float().mean().item() <= 1e-4 or near.sum().item() <= 2
+    # mismatches themselves must be rare (being *near* a boundary is not: with a
+    # +-1e-6 window, C * K edges and ~uniform probabilities, ~1e-3 of voxels are)
+    assert bad_voxels.float().mean().item() <= 1e-3
 
 
 HALF = [
