@@ -12,8 +12,10 @@ src/ace_kernels/
   config.py          ACEConfig: all loss options (pydantic)
   registry.py        ace_loss(input, target, config, impl=...) + implementation registry
   impls/             one module per implementation: reference, baselines
-                     (compile, checkpoint), v1_vectorized, v1_clean(+compile)
+                     (compile, checkpoint), v1_vectorized, v1_clean(+compile),
+                     v2_recompute / v2_grad_in_fwd (handwritten backward)
   common.py          shared pre/post-processing, bin boundaries, soft weights
+  binning.py         per-bin sums W, P, G for hard/soft (shared by v1_clean, v2)
   cases.py           deterministic inputs + named edge cases (shared by tests/bench)
   instrumentation.py bytes saved for backward (saved_tensors_hooks)
 src/ace_bench/       measurement: run.py (benchmarks), profile.py, report.py,
@@ -24,6 +26,7 @@ tests/               correctness gate, parametrized over every registered impl
   golden/            stored reference loss + grad per case
 scripts/make_golden.py
 docs/report.md       sprint notes and results
+docs/derivation.md   forward + handwritten backward math (v2)
 ```
 
 ## Usage

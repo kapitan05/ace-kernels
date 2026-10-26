@@ -16,9 +16,13 @@ pytestmark = [
 ]
 
 
+GRAPH_SAFE = ["v1_clean", "v2_recompute", "v2_grad_in_fwd"]
+
+
+@pytest.mark.parametrize("impl", GRAPH_SAFE)
 @pytest.mark.parametrize("binning", ["hard", "soft"])
 @pytest.mark.parametrize("include_background", [True, False])
-def test_v1_clean_has_no_host_sync(binning: str, include_background: bool) -> None:
+def test_has_no_host_sync(impl: str, binning: str, include_background: bool) -> None:
     config = ACEConfig.model_validate(
         {
             "binning": binning,
@@ -29,11 +33,11 @@ def test_v1_clean_has_no_host_sync(binning: str, include_background: bool) -> No
     )
     x, y = make_inputs(InputSpec(2, 4, (16, 16, 16)), config, "cuda")
     x.requires_grad_(True)
-    ace_loss(x, y, config, impl="v1_clean")  # warm up lazy init outside the check
+    ace_loss(x, y, config, impl=impl)  # warm up lazy init outside the check
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")
     try:
-        loss = ace_loss(x, y, config, impl="v1_clean")
+        loss = ace_loss(x, y, config, impl=impl)
         (grad,) = torch.autograd.grad(loss, x)
     finally:
         torch.cuda.set_sync_debug_mode("default")
@@ -56,8 +60,9 @@ def test_reference_soft_is_not_graph_capturable() -> None:
         ace_loss(x, y, config, impl="reference")
 
 
+@pytest.mark.parametrize("impl", GRAPH_SAFE)
 @pytest.mark.parametrize("binning", ["hard", "soft"])
-def test_v1_clean_captures_in_cuda_graph(binning: str) -> None:
+def test_captures_in_cuda_graph(impl: str, binning: str) -> None:
     """No host<->device copies or syncs: fwd+bwd can be captured and replayed."""
     config = ACEConfig.model_validate(
         {"binning": binning, "to_onehot_y": True, "weight": (1.0, 2.0, 0.5, 1.0)}
@@ -66,7 +71,7 @@ def test_v1_clean_captures_in_cuda_graph(binning: str) -> None:
     x.requires_grad_(True)
 
     def step() -> torch.Tensor:
-        (grad,) = torch.autograd.grad(ace_loss(x, y, config, impl="v1_clean"), x)
+        (grad,) = torch.autograd.grad(ace_loss(x, y, config, impl=impl), x)
         return grad
 
     stream = torch.cuda.Stream()

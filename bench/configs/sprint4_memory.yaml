@@ -1,0 +1,19 @@
+# Sprint 4: memory headroom. Large volumes where the reference's saved tensors
+# (11x input for soft) approach the T4's 15 GiB; v2 should still fit.
+name: sprint4-memory
+group: sprint4-v2
+hypothesis: >-
+  At volumes where reference soft peaks at several GiB, v2_recompute peaks near the
+  input size plus transient backward temporaries and fits volumes where the
+  reference runs out of memory.
+device: cuda
+impls: [reference, v1_clean, v2_recompute, v2_grad_in_fwd]
+binnings: [soft, hard]
+modes: [fwd_bwd]
+warmup: 2
+reps: 5
+shapes:
+  - {name: cube192, batch: 2, channels: 4, spatial: [192, 192, 192]}
+  - {name: cube256, batch: 2, channels: 4, spatial: [256, 256, 256]}
+  - {name: cube288, batch: 2, channels: 4, spatial: [288, 288, 288]}
+  - {name: amos-b4, batch: 4, channels: 16, spatial: [176, 176, 64]}

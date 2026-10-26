@@ -235,3 +235,29 @@ GPU time in scatter/gather kernels (kits23 profiles): v1_vectorized 92% / 65%
   processes, and each row records memory left allocated. That column located the leak
   in `measure_saved_tensors`: the pack hook returned the tensor itself, creating
   uncollectable tensor<->grad_fn cycles for saved outputs (fixed + regression test).
+
+## Sprint 4: v2, handwritten backward (2026-10-26)
+
+**Done (GPU numbers pending `kaggle/run_sprint4.sh`)**
+- `docs/derivation.md`: forward, backward (`∂f/∂p_i = Σ_j s_kj/(K_ne W_kj)
+  [w_ij + w'_ij (p_i - y_i - d_kj)]`), activation chain, edge cases, memory table.
+- `binning.py`: per-bin sums shared by v1_clean and v2 (refactor, v1_clean unchanged).
+- `v2_recompute`: one `autograd.Function` logits -> loss; forward without autograd;
+  saves inputs + `coef`, `d` (`[B, C, K]`); backward recomputes softmax/bins.
+- `v2_grad_in_fwd`: gradient computed in forward, saved (1x input), scaled in
+  backward (mean/sum reductions; falls back to recompute for `none`).
+- Mask/weights/reduction gradient via autograd on `[B, C]` (exact semantics).
+- Tests (380 pass on CPU): both variants pass all 43 golden cases (loss + grad) and
+  hypothesis equivalence; **fp64 gradcheck** (finite differences) for 6 configs x
+  hard/soft; **fp64 match vs autograd** through v1_clean to 1e-9 on 30 random cases;
+  saved bytes exactly `2 B C K` floats (recompute) / 1x input (grad_in_fwd); CUDA
+  no-sync and graph-capture tests extended to v2.
+
+**Findings (device-independent, 2x4x32^3)**
+
+| impl | saved for backward, hard | soft |
+|---|---|---|
+| reference | 3.00x input | 11.00x |
+| v1_clean | 3.00x | 11.75x |
+| v2_recompute | **0.0012x** (1.3 KB) | **0.0012x** |
+| v2_grad_in_fwd | 1.00x | 1.00x |

@@ -37,10 +37,11 @@ class SoftAssignment:
     right_idx: torch.Tensor
     left_w: torch.Tensor  # interpolation weights, differentiable w.r.t. p
     right_w: torch.Tensor
+    span: torch.Tensor  # S = c_r - c_l: d left_w/dp = -1/S, d right_w/dp = +1/S
 
 
 def soft_assign(p: torch.Tensor, num_bins: int, right: bool) -> SoftAssignment:
-    half = soft_half_boundaries(num_bins, p.device)
+    half = soft_half_boundaries(num_bins, p.device).to(p.dtype)
     half_idx = torch.bucketize(p, half[1:], right=right)
     left_idx = torch.clamp(half_idx - 1, min=0) // 2
     right_idx = torch.clamp(half_idx + 1, max=2 * num_bins - 1) // 2
@@ -52,7 +53,11 @@ def soft_assign(p: torch.Tensor, num_bins: int, right: bool) -> SoftAssignment:
     right_dist = repl[half_idx + 2] - p
     sum_dist = left_dist + right_dist
     return SoftAssignment(
-        left_idx, right_idx, right_dist / sum_dist, left_dist / sum_dist
+        left_idx,
+        right_idx,
+        right_dist / sum_dist,
+        left_dist / sum_dist,
+        sum_dist,
     )
 
 
@@ -72,7 +77,12 @@ class Prepared:
     spatial_ndim: int
 
 
-def _activate(x: torch.Tensor, config: ACEConfig) -> torch.Tensor:
+def compute_dtype(x: torch.Tensor) -> torch.dtype:
+    """float64 stays float64 (gradcheck); anything else -> float32 as the reference."""
+    return torch.float64 if x.dtype == torch.float64 else torch.float32
+
+
+def activate(x: torch.Tensor, config: ACEConfig) -> torch.Tensor:
     if config.activation == "sigmoid":
         return torch.sigmoid(x)
     if config.activation == "softmax" and x.shape[1] > 1:
@@ -93,7 +103,8 @@ def prepare(
     """
     if input.dim() < 3:
         raise ValueError(f"input must be [B, C, *spatial], got {tuple(input.shape)}")
-    probs = _activate(input, config)
+    probs = activate(input, config)
+    dtype = compute_dtype(input)
     n_ch = input.shape[1]
     drop_bg = not config.include_background and n_ch > 1
     use_labels = config.to_onehot_y and n_ch > 1
@@ -105,13 +116,13 @@ def prepare(
             probs = probs[:, 1:]
         if labels.shape[-1] != probs[0, 0].numel():
             raise AssertionError("target and input spatial sizes differ")
-        return Prepared(probs.flatten(2).float(), None, labels, input.dim() - 2)
+        return Prepared(probs.flatten(2).to(dtype), None, labels, input.dim() - 2)
 
     if use_labels:
         idx = target.long()
-        onehot = torch.zeros_like(probs, dtype=torch.float32).scatter_(1, idx, 1.0)
+        onehot = torch.zeros_like(probs, dtype=dtype).scatter_(1, idx, 1.0)
     else:
-        onehot = target.float()
+        onehot = target.to(dtype)
     if drop_bg:
         probs, onehot = probs[:, 1:], onehot[:, 1:]
     if onehot.shape != probs.shape:
@@ -119,7 +130,9 @@ def prepare(
             f"ground truth has different shape ({tuple(onehot.shape)}) from input "
             f"({tuple(probs.shape)})"
         )
-    return Prepared(probs.flatten(2).float(), onehot.flatten(2), None, input.dim() - 2)
+    return Prepared(
+        probs.flatten(2).to(dtype), onehot.flatten(2), None, input.dim() - 2
+    )
 
 
 def nonempty_classes(prep: Prepared) -> torch.Tensor:
@@ -138,9 +151,13 @@ def finalize(
     per_bin_error: torch.Tensor, prep: Prepared, config: ACEConfig
 ) -> torch.Tensor:
     """``[B, C, K]`` |mean_p - mean_gt| (NaN = empty bin) -> reduced loss."""
-    f = torch.nanmean(per_bin_error, dim=-1)
+    return reduce_classes(torch.nanmean(per_bin_error, dim=-1), prep, config)
+
+
+def reduce_classes(f: torch.Tensor, prep: Prepared, config: ACEConfig) -> torch.Tensor:
+    """``[B, C]`` per-class error -> loss: empty-class mask, weights, reduction."""
     if config.ignore_empty_classes:
-        f = f * nonempty_classes(prep).float()
+        f = f * nonempty_classes(prep).to(f.dtype)
     n_ch = f.shape[1]
     if config.weight is not None and n_ch != 1:
         # checked on the Python config values: no device -> host sync

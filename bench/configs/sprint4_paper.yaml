@@ -1,0 +1,21 @@
+# Sprint 4: handwritten backward (v2) vs the best default-autograd versions.
+name: sprint4-paper
+group: sprint4-v2
+hypothesis: >-
+  v2 cuts saved-for-backward memory from ~3x (hard) / ~11x (soft) input to O(B*C*K)
+  (recompute) or 1x (grad_in_fwd), and lowers peak memory below the reference.
+  Time stays in the same range as v1_clean: the forward still uses the contended
+  scatter_add, but the backward replaces scatter-backward (gather) chains with one
+  gather + elementwise pass; recompute pays an extra softmax/binning pass.
+device: cuda
+impls: [reference, v1_clean, v1_clean_compile, v2_recompute, v2_grad_in_fwd]
+binnings: [hard, soft]
+modes: [fwd, fwd_bwd]
+cuda_graph: true
+warmup: 3
+reps: 10
+shapes:
+  - {name: kits23, batch: 2, channels: 4, spatial: [128, 128, 128]}
+  - {name: acdc17, batch: 2, channels: 4, spatial: [256, 256, 16]}
+  - {name: brats21, batch: 2, channels: 4, spatial: [224, 224, 144]}
+  - {name: amos22, batch: 2, channels: 16, spatial: [176, 176, 64]}
