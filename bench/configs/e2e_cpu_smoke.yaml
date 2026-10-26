@@ -1,0 +1,15 @@
+# Pipeline smoke test of ace_bench.e2e on CPU (tiny network). Not a result.
+name: e2e-cpu-smoke
+group: e2e-smoke
+hypothesis: "Pipeline trains, logs curves, probes patches, writes summary + plots."
+device: cpu
+impls: [reference, v2_recompute]
+binnings: [hard, soft]
+classes: 3
+batch: 1
+patch: [32, 32, 32]
+steps: 3
+skip_steps: 1
+init_filters: 8
+amp: false
+max_patch_candidates: [32]

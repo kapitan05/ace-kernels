@@ -1,0 +1,20 @@
+# Sprint 8b: the loss inside the paper's training step (SegResNetDS, deep
+# supervision, Dice + CE + mL1-ACE, AdamW, AMP), synthetic learnable volumes.
+name: sprint8-e2e
+group: sprint8-e2e
+hypothesis: >-
+  The optimized losses train identically (loss curves overlap the reference within
+  fp noise). The reference loss is a large share of the step at the paper's patch
+  sizes, so v5 shortens the training step noticeably, and its lower loss memory
+  lets larger patches fit (especially soft binning).
+device: cuda
+impls: [reference, v4_triton, v5_triton]
+binnings: [hard, soft]
+classes: 4
+batch: 1
+patch: [128, 128, 128]
+steps: 60
+skip_steps: 5
+init_filters: 32
+amp: true
+max_patch_candidates: [128, 160, 192, 224, 256]

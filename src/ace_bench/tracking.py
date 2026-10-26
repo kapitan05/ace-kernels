@@ -139,6 +139,33 @@ def mirror_profiles(
         return tracker.url
 
 
+def mirror_e2e(run_dir: Path, project: str = "ace-kernels") -> str | None:
+    """One W&B run per (impl, binning) with per-step curves (overlay in the UI)."""
+    meta = json.loads((run_dir / "meta.json").read_text())
+    config = meta["config"]
+    steps = pl.read_parquet(run_dir / "steps.parquet")
+    url = None
+    for (impl, binning), d in steps.group_by("impl", "binning", maintain_order=True):
+        with Tracker(
+            True,
+            project=project,
+            group=config["group"],
+            job_type="e2e",
+            name=f"{meta['run_id']}-{impl}-{binning}",
+            config={**config, "impl": impl, "binning": binning, "env": meta["env"]},
+            tags=[str(impl), str(binning), "e2e"],
+        ) as tracker:
+            if tracker._run is not None:
+                for r in d.iter_rows(named=True):
+                    tracker._run.log(
+                        {k: r[k] for k in ("loss", "ace", "step_ms", "peak_mib")},
+                        step=r["step"],
+                    )
+            tracker.log_images(sorted((run_dir / "plots").glob("*.png")))
+            url = tracker.url
+    return url
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Mirror benchmark results to W&B (key from `wandb login`)"
@@ -151,8 +178,10 @@ def main() -> None:
         raise SystemExit(f"no runs (meta.json) or profiles (ops.txt) under {args.path}")
     groups = set()
     for run_dir in runs:
-        groups.add(json.loads((run_dir / "meta.json").read_text())["config"]["group"])
-        print(f"{run_dir.name}: {mirror_run(run_dir)}")
+        meta = json.loads((run_dir / "meta.json").read_text())
+        groups.add(meta["config"]["group"])
+        mirror = mirror_e2e if meta.get("kind") == "e2e" else mirror_run
+        print(f"{run_dir.name}: {mirror(run_dir)}")
     if has_profiles:
         group = groups.pop() if len(groups) == 1 else "profiles"
         logs = sorted(args.path.glob("*.log"))

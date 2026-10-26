@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from ace_bench import calculator
+from ace_bench.calculator import Mode
 from ace_bench.config import BenchConfig, ShapeSpec
 from ace_bench.env import REPO_ROOT, collect_env, peak_bandwidth_gbps
 from ace_bench.measure import Row, compute_reference, measure_case, rows_to_frame
@@ -23,7 +24,10 @@ TINY = ShapeSpec(name="tiny", batch=1, channels=3, spatial=(8, 8, 8))
 
 @pytest.mark.parametrize("path", sorted(CONFIG_DIR.glob("*.yaml")), ids=str)
 def test_bench_configs_are_valid(path: Path) -> None:
-    config = BenchConfig.from_yaml(path)
+    from ace_bench.e2e import E2EConfig
+
+    # end-to-end experiments (``*e2e*.yaml``) have their own schema
+    config = (E2EConfig if "e2e" in path.name else BenchConfig).from_yaml(path)
     for impl in config.impls:
         if impl in TRITON_IMPLS and not HAS_TRITON:
             continue  # Linux+CUDA-only impl, absent on this machine
@@ -58,10 +62,10 @@ def test_timing_cpu() -> None:
 
 
 @pytest.mark.parametrize("mode", ["fwd", "fwd_bwd"])
-def test_measure_case_cpu(mode: str) -> None:
+def test_measure_case_cpu(mode: Mode) -> None:
     env = collect_env("cpu")
     config = ACEConfig(binning="soft", to_onehot_y=True)
-    row = measure_case("reference", TINY, config, mode, env, warmup=1, reps=2)  # type: ignore[arg-type]
+    row = measure_case("reference", TINY, config, mode, env, warmup=1, reps=2)
     assert row.status == "ok", row.error
     assert row.p50_ms is not None and row.p50_ms > 0
     assert row.saved_extra_bytes is not None and row.saved_extra_bytes > 0
@@ -218,3 +222,28 @@ def test_reference_falls_back_when_it_runs_out_of_memory(
     monkeypatch.setattr(measure_mod, "ace_loss", oom_for_reference)
     ref = compute_reference(TINY, ACEConfig(binning="soft", to_onehot_y=True), "cpu")
     assert ref is not None and ref.impl == "v2_recompute"
+
+
+def test_e2e_training_curves_match_reference() -> None:
+    """Same seed + identical synthetic batches: v2 trains like the reference."""
+    from ace_bench.e2e import E2EConfig, train_curve
+
+    cfg = E2EConfig(
+        name="t",
+        group="g",
+        hypothesis="h",
+        device="cpu",
+        impls=["reference", "v2_recompute"],
+        classes=3,
+        batch=1,
+        patch=[32, 32, 32],  # SegResNetDS downsamples 4x
+        steps=2,
+        skip_steps=0,
+        init_filters=4,
+        amp=False,
+    )
+    for binning in ("hard", "soft"):
+        ref = train_curve(cfg, "reference", binning)
+        v2 = train_curve(cfg, "v2_recompute", binning)
+        for a, b in zip(ref, v2, strict=True):
+            assert abs(a.loss - b.loss) <= 1e-4 * abs(a.loss), (binning, a, b)

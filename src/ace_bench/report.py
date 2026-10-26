@@ -304,3 +304,90 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def write_e2e_summary(out: Path) -> str:
+    """Tables + plots for an end-to-end run (steps.parquet, probes.parquet)."""
+    meta = json.loads((out / "meta.json").read_text())
+    cfg, env = meta["config"], meta["env"]
+    steps = pl.read_parquet(out / "steps.parquet")
+    probes = pl.read_parquet(out / "probes.parquet")
+    timed = steps.filter(pl.col("step") >= cfg["skip_steps"])
+    lines = [
+        f"# {cfg['name']} ({meta['run_id']})",
+        "",
+        f"Hypothesis: {cfg['hypothesis']}",
+        "",
+        f"Device: {env['device_name']} | torch {env['torch_version']} | "
+        f"git {env['git_sha']} | SegResNetDS init_filters {cfg['init_filters']} | "
+        f"patch {cfg['patch']} x batch {cfg['batch']} | {cfg['classes']} classes | "
+        f"AMP {cfg['amp']} | {cfg['steps']} steps (first {cfg['skip_steps']} untimed)",
+        "",
+    ]
+    plot_dir = out / "plots"
+    plot_dir.mkdir(exist_ok=True)
+    for binning in steps["binning"].unique(maintain_order=True).to_list():
+        sub = timed.filter(pl.col("binning") == binning)
+        ref = steps.filter(
+            (pl.col("binning") == binning) & (pl.col("impl") == "reference")
+        )
+        table = sub.group_by("impl", maintain_order=True).agg(
+            pl.col("step_ms").median().round(1).alias("step ms (median)"),
+            pl.col("peak_mib").max().round(0).alias("peak MiB"),
+        )
+        if ref.height:
+            ref_ms = ref.filter(pl.col("step") >= cfg["skip_steps"])["step_ms"].median()
+            joined = steps.filter(pl.col("binning") == binning).join(
+                ref.select("step", pl.col("loss").alias("ref_loss")), on="step"
+            )
+            dev = joined.group_by("impl", maintain_order=True).agg(
+                ((pl.col("loss") - pl.col("ref_loss")).abs() / pl.col("ref_loss"))
+                .max()
+                .map_elements(_sci, return_dtype=pl.String)
+                .alias("max loss rel diff vs reference")
+            )
+            table = table.join(dev, on="impl").with_columns(
+                (ref_ms / pl.col("step ms (median)")).round(2).alias("step speedup")
+            )
+        best = (
+            probes.filter((pl.col("binning") == binning) & (pl.col("status") == "ok"))
+            .group_by("impl")
+            .agg(pl.col("patch").max().alias("max patch (cube)"))
+        )
+        if best.height:
+            table = table.join(best, on="impl", how="left")
+        lines += [f"## {binning} binning", "", to_markdown(table), ""]
+        fig, axes = plt.subplots(1, 2, figsize=(10, 3.6), facecolor=SURFACE)
+        for i, impl in enumerate(cfg["impls"]):
+            d = steps.filter((pl.col("binning") == binning) & (pl.col("impl") == impl))
+            if d.height == 0:
+                continue
+            color = SERIES[i % len(SERIES)]
+            axes[0].plot(d["step"], d["loss"], color=color, linewidth=2, label=impl)
+            axes[1].plot(d["step"], d["step_ms"], color=color, linewidth=2, label=impl)
+        for ax, title in zip(axes, ("Training loss", "Step time, ms"), strict=True):
+            ax.set_facecolor(SURFACE)
+            ax.set_title(title, fontsize=9, color=TEXT, loc="left")
+            ax.set_xlabel("step", fontsize=8, color=TEXT_2)
+            ax.grid(color=GRID, linewidth=0.6)
+            for spine in ("top", "right"):
+                ax.spines[spine].set_visible(False)
+            ax.tick_params(colors=TEXT_2, labelsize=8)
+        axes[0].legend(frameon=False, fontsize=8)
+        fig.suptitle(
+            f"{binning} binning, end-to-end training",
+            x=0.01,
+            ha="left",
+            fontsize=10,
+            color=TEXT,
+        )
+        fig.tight_layout()
+        fig.savefig(plot_dir / f"e2e-{binning}.png", dpi=150, facecolor=SURFACE)
+        plt.close(fig)
+        lines.append(f"![e2e-{binning}](plots/e2e-{binning}.png)")
+        lines.append("")
+    if probes.height:
+        lines += ["## Max-patch probes", "", to_markdown(probes), ""]
+    text = "\n".join(lines)
+    (out / "summary.md").write_text(text)
+    return text
