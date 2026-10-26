@@ -14,6 +14,7 @@ from ace_bench.report import write_summary
 from ace_bench.run import Job, run_isolated
 from ace_bench.timing import measure
 from ace_kernels import ACEConfig, get_impl
+from ace_kernels.kernels import HAS_TRITON, TRITON_IMPLS
 
 CONFIG_DIR = REPO_ROOT / "bench" / "configs"
 TINY = ShapeSpec(name="tiny", batch=1, channels=3, spatial=(8, 8, 8))
@@ -23,6 +24,8 @@ TINY = ShapeSpec(name="tiny", batch=1, channels=3, spatial=(8, 8, 8))
 def test_bench_configs_are_valid(path: Path) -> None:
     config = BenchConfig.from_yaml(path)
     for impl in config.impls:
+        if impl in TRITON_IMPLS and not HAS_TRITON:
+            continue  # Linux+CUDA-only impl, absent on this machine
         get_impl(impl)  # raises on typos
 
 
