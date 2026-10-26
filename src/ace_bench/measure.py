@@ -72,6 +72,13 @@ class Row(BaseModel):
     grad_err_truth: float | None = None
     ref_loss_err_truth: float | None = None
     ref_grad_err_truth: float | None = None
+    # Relative L2 gradient errors ||g - g_ref|| / ||g_ref||. The max-norm errors
+    # above are dominated by ill-conditioned voxels (|x| kink: bins whose mean_p -
+    # mean_y is ~0 flip gradient sign under any reordering; hard-bin edge flips):
+    # measured up to 0.54 even for the reference vs float64 truth.
+    grad_l2_err: float | None = None
+    grad_l2_err_truth: float | None = None
+    ref_grad_l2_err_truth: float | None = None
 
 
 _POLARS_TYPES: dict[str, type[pl.DataType]] = {
@@ -114,6 +121,7 @@ class Reference:
     truth_grad: torch.Tensor | None = None
     ref_loss_err_truth: float | None = None
     ref_grad_err_truth: float | None = None
+    ref_grad_l2_err_truth: float | None = None
 
 
 TRUTH_IMPL = "v2_recompute"  # evaluated in float64
@@ -123,6 +131,12 @@ def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
     """max |a - b| / max |b| (b: the trusted value)."""
     diff = (a.double() - b.double()).abs().max()
     return float(diff / b.double().abs().max().clamp_min(1e-12))
+
+
+def _rel_l2(a: torch.Tensor, b: torch.Tensor) -> float:
+    """||a - b||_2 / ||b||_2 (b: the trusted value)."""
+    diff = torch.linalg.vector_norm(a.double() - b.double())
+    return float(diff / torch.linalg.vector_norm(b.double()).clamp_min(1e-30))
 
 
 def _loss_and_grad(
@@ -164,6 +178,7 @@ def compute_reference(
         ref.truth_loss, ref.truth_grad = loss64.detach().cpu(), grad64.cpu()
         ref.ref_loss_err_truth = _rel(ref.loss, ref.truth_loss)
         ref.ref_grad_err_truth = _rel(ref.grad, ref.truth_grad)
+        ref.ref_grad_l2_err_truth = _rel_l2(ref.grad, ref.truth_grad)
     except torch.OutOfMemoryError:
         pass  # rows then carry no truth comparison
     release_memory(device)
@@ -182,14 +197,17 @@ def _check_output(
     row.checked_against = ref.impl
     row.ref_loss_err_truth = ref.ref_loss_err_truth
     row.ref_grad_err_truth = ref.ref_grad_err_truth
+    row.ref_grad_l2_err_truth = ref.ref_grad_l2_err_truth
     if impl == ref.impl:
         loss, grad = ref.loss, ref.grad
     else:
         loss, grad = _loss_and_grad(impl, x, y, config)
     row.loss_rel_err, row.grad_rel_err = _rel(loss, ref.loss), _rel(grad, ref.grad)
+    row.grad_l2_err = _rel_l2(grad, ref.grad)
     if ref.truth_loss is not None and ref.truth_grad is not None:
         row.loss_err_truth = _rel(loss, ref.truth_loss)
         row.grad_err_truth = _rel(grad, ref.truth_grad)
+        row.grad_l2_err_truth = _rel_l2(grad, ref.truth_grad)
 
 
 def _step_fn(

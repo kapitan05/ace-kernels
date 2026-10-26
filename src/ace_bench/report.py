@@ -40,6 +40,9 @@ def _clean(df: pl.DataFrame) -> pl.DataFrame:
         ("grad_err_truth", pl.Float64),
         ("ref_loss_err_truth", pl.Float64),
         ("ref_grad_err_truth", pl.Float64),
+        ("grad_l2_err", pl.Float64),
+        ("grad_l2_err_truth", pl.Float64),
+        ("ref_grad_l2_err_truth", pl.Float64),
     ):  # runs before the output check
         if col not in df.columns:
             df = df.with_columns(pl.lit(None, dtype).alias(col))
@@ -88,16 +91,18 @@ def _sci(v: float | None) -> str | None:
 
 
 def _flagged(r: dict[str, Any]) -> bool:
-    """Less accurate than the reference? Judged against float64 truth when available
-    (two fp32 results may differ while being equally accurate)."""
-    if r.get("grad_err_truth") is not None and r.get("ref_grad_err_truth") is not None:
-        worse = [
-            r[f"{q}_err_truth"] > max(2 * r[f"ref_{q}_err_truth"], 1e-5)
-            for q in ("loss", "grad")
-        ]
-        return any(worse)
+    """Less accurate than the reference? Uses the loss and the L2 gradient error
+    (the max-norm gradient error is dominated by ill-conditioned voxels), against
+    the float64 truth when available, else against the reference."""
+    if r.get("grad_l2_err_truth") is not None and r.get("ref_grad_l2_err_truth"):
+        return bool(
+            r["loss_err_truth"] > max(2 * r["ref_loss_err_truth"], 1e-5)
+            or r["grad_l2_err_truth"] > max(2 * r["ref_grad_l2_err_truth"], 1e-4)
+        )
+    l2 = r.get("grad_l2_err")
     return bool(
-        r["loss_rel_err"] > VERIFY_TOLERANCE or r["grad_rel_err"] > VERIFY_TOLERANCE
+        r["loss_rel_err"] > VERIFY_TOLERANCE
+        or (l2 is not None and l2 > 10 * VERIFY_TOLERANCE)
     )
 
 
@@ -113,30 +118,31 @@ def verification_summary(df: pl.DataFrame) -> list[str]:
         f"Output check (same input, vs {against}): {checked.height} rows, "
         f"max loss rel err {max_loss:.1e}, max grad rel err {max_grad:.1e}."
     ]
-    with_truth = checked.filter(pl.col("grad_err_truth").is_not_null())
+    with_truth = checked.filter(pl.col("grad_l2_err_truth").is_not_null())
     if with_truth.height:
+        mx = lambda c: with_truth.select(pl.col(c).max()).item()  # noqa: E731
         lines.append(
-            f"vs float64 truth ({with_truth.height} rows): max grad err "
-            f"{with_truth.select(pl.col('grad_err_truth').max()).item():.1e} "
-            f"(reference itself: up to "
-            f"{with_truth.select(pl.col('ref_grad_err_truth').max()).item():.1e}). "
-            "Flag: > 2x the reference's own error vs truth (and > 1e-5); without "
-            f"truth: > {VERIFY_TOLERANCE:.0e} vs reference."
+            f"vs float64 truth ({with_truth.height} rows): max loss err "
+            f"{mx('loss_err_truth'):.1e} (reference {mx('ref_loss_err_truth'):.1e}), "
+            f"max L2 grad err {mx('grad_l2_err_truth'):.1e} "
+            f"(reference {mx('ref_grad_l2_err_truth'):.1e}). Flag: loss or L2 grad "
+            "error > 2x the reference's own vs truth. Max-norm grad errors are "
+            "diagnostic only (|x| kink / bin-edge voxels)."
         )
     for r in checked.iter_rows(named=True):
         if not _flagged(r):
             continue
         truth = (
-            f"; vs truth loss {r['loss_err_truth']:.1e} grad {r['grad_err_truth']:.1e}"
-            f" (reference {r['ref_loss_err_truth']:.1e} /"
-            f" {r['ref_grad_err_truth']:.1e})"
-            if r.get("grad_err_truth") is not None
+            f"; vs truth loss {r['loss_err_truth']:.1e} L2 grad "
+            f"{r['grad_l2_err_truth']:.1e} (reference {r['ref_loss_err_truth']:.1e} /"
+            f" {r['ref_grad_l2_err_truth']:.1e})"
+            if r.get("grad_l2_err_truth") is not None
             else ""
         )
         lines.append(
             f"**WARNING** {r['shape']} {r['binning']} {r['impl']} {r['mode']}: "
             f"vs {r['checked_against']} loss {r['loss_rel_err']:.1e} "
-            f"grad {r['grad_rel_err']:.1e}{truth}"
+            f"L2 grad {r.get('grad_l2_err') or 0:.1e}{truth}"
         )
     return lines
 

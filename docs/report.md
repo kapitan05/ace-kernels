@@ -392,10 +392,41 @@ Memory sweep (2 x 4 x V^3 soft): reference OOM at 288^3; v4 at 288^3: 92.9 ms,
 1. Triton v3/v4: gradients within 0.8e-5..8.4e-5 of the reference, every row.
 2. `torch.compile` (reference_compile, v1_clean_compile), soft only: loss matches but
    gradients deviate by 0.46-1.4% (relative to the max gradient) on every paper
-   shape. On CPU all versions are within 7e-6 of a float64 truth, so this is
-   specific to Inductor's CUDA code. The small golden tests ran compiled impls only
-   on 5 smoke cases, so this was invisible before.
+   shape. **Correction (float64 verification run, `47c938d`):** this is not a
+   compile defect. Max-norm gradient errors are dominated by ill-conditioned
+   voxels: in bins where mean_p - mean_y is ~0, the |x| kink makes the gradient
+   sign depend on rounding, so any change of summation order flips the gradient of
+   the whole bin. Even the reference itself is 1-54% (max norm) from a float64
+   truth. See "Accuracy against float64 truth" below.
 3. v2_recompute soft at 256^3 / 288^3: loss 6.2e-5 / 1.3e-4, grad 1.4e-4 / 2.5e-4
    vs the reference (fp32 sums over ~16M voxels per bin; v4's tree sums deviate
    less). Comparing two fp32 results cannot say which is closer to the exact
    value: next step is a float64-truth comparison in the output check.
+
+## Accuracy against float64 truth (2026-10-26)
+
+Verification run `results/kaggle/47c938da465d-run-verify/` (T4): soft + hard, kits23 /
+brats21 / amos22 / 256^3, six implementations, each compared with v2_recompute in
+float64 (formula validated by gradcheck) on the same input.
+
+**Loss error vs float64** (well-conditioned):
+
+| | hard | soft |
+|---|---|---|
+| reference | 4.1e-7 .. 2.2e-6 | 3.3e-8 .. 1.3e-5 |
+| v4_triton | 3.3e-8 .. 8.7e-7 | 2.2e-8 .. 8.1e-7 |
+| v5_triton | 2.1e-8 .. 9.7e-7 | 2.2e-8 .. 8.1e-7 |
+| v1_clean_compile / v2_recompute | ~reference | up to 7.5e-5 (256^3) |
+
+The Triton kernels' loss is 10-100x closer to the exact value than the reference's
+at large volumes (block-wise tree sums instead of one long sequence of fp32 atomic
+adds); v2 / v1 (one scatter_add over all slices) are the least accurate at 256^3.
+
+**Max-norm gradient error vs float64 is not a meaningful metric at scale**: up to
+0.54 for every implementation including the reference. Two mechanisms: (1) the |x|
+kink: the gradient of a bin is +-1/(K W) with the sign of mean_p - mean_y; bins with
+that difference ~0 flip sign under any reordering; (2) hard binning: a probability
+within ~1e-7 of an edge is binned differently in fp32 vs fp64. This is a property
+of the loss (L1 of per-bin differences), not of an implementation. The output
+check now reports the relative L2 gradient error and flags on loss + L2 (`next`
+commit); max-norm errors stay as diagnostics.
