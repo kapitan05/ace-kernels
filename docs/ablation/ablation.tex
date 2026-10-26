@@ -1,0 +1,39 @@
+\begin{table}[t]
+\centering\small
+\begin{tabular}{lllrrrrrrr}
+\toprule
+sprint & impl & change & kits23 ms & acdc17 ms & brats21 ms & amos22 ms & \% peak BW (kits23) & peak MiB (brats21) & saved MiB (brats21) \\
+\midrule
+S1 & reference & original upstream loss & 99.4 (1.0x) & 50.0 (1.0x) & 342.3 (1.0x) & 793.7 (1.0x) & 0.8 & 1106 & 661.5 \\
+S2 & reference\_checkpoint & + torch.utils.checkpoint & 168.6 (0.6x) & 85.1 (0.6x) & 587.1 (0.6x) & 1287.5 (0.6x) & 0.5 & 1108 & 0.0 \\
+S2 & reference\_compile & + torch.compile & 66.1 (1.5x) & 33.3 (1.5x) & 237.6 (1.4x) & 500.9 (1.6x) & 1.3 & 914 & 441.0 \\
+S3 & v1\_vectorized & B x C loop removed & 84.3 (1.2x) & 41.7 (1.2x) & 307.9 (1.1x) & 598.7 (1.3x) & 1.0 & 1546 & 661.5 \\
+S3 & v1\_clean & + sums, no one-hot, no host sync & 38.2 (2.6x) & 18.5 (2.7x) & 134.4 (2.5x) & 214.4 (3.7x) & 2.2 & 1712 & 661.5 \\
+S3 & v1\_clean\_compile & + torch.compile & 19.0 (5.2x) & 9.6 (5.2x) & 66.8 (5.1x) & 107.9 (7.4x) & 4.4 & 884 & 441.0 \\
+S4 & v2\_recompute & handwritten backward (PyTorch) & 38.2 (2.6x) & 18.9 (2.6x) & 139.9 (2.4x) & 232.0 (3.4x) & 2.2 & 1712 & 0.0 \\
+S5 & v3\_triton & Triton private-histogram forward & 10.4 (9.6x) & 5.2 (9.7x) & 36.0 (9.5x) & 41.9 (19.0x) & 8.1 & 1104 & 0.0 \\
+S6/S7 & v4\_triton & + Triton backward & 4.9 (20.5x) & 2.4 (20.9x) & 17.2 (19.9x) & 20.4 (39.0x) & 17.3 & 441 & 0.0 \\
+\bottomrule
+\end{tabular}
+\caption{Ablation, hard binning (Tesla T4)}
+\end{table}
+
+\begin{table}[t]
+\centering\small
+\begin{tabular}{lllrrrrrrr}
+\toprule
+sprint & impl & change & kits23 ms & acdc17 ms & brats21 ms & amos22 ms & \% peak BW (kits23) & peak MiB (brats21) & saved MiB (brats21) \\
+\midrule
+S1 & reference & original upstream loss & 181.7 (1.0x) & 92.9 (1.0x) & 606.5 (1.0x) & 1492.3 (1.0x) & 0.5 & 3008 & 2425.5 \\
+S2 & reference\_checkpoint & + torch.utils.checkpoint & 279.2 (0.7x) & 145.6 (0.6x) & 941.2 (0.6x) & 2117.9 (0.7x) & 0.3 & 3008 & 0.0 \\
+S2 & reference\_compile & + torch.compile & 39.8 (4.6x) & 19.2 (4.8x) & 136.1 (4.5x) & 2689.7 (0.6x) & 2.1 & 2388 & 1157.6 \\
+S3 & v1\_vectorized & B x C loop removed & 131.6 (1.4x) & 65.4 (1.4x) & 440.1 (1.4x) & 728.5 (2.0x) & 0.6 & 3756 & 2425.5 \\
+S3 & v1\_clean & + sums, no one-hot, no host sync & 115.5 (1.6x) & 57.0 (1.6x) & 382.5 (1.6x) & 546.1 (2.7x) & 0.7 & 3866 & 2590.9 \\
+S3 & v1\_clean\_compile & + torch.compile & 56.2 (3.2x) & 27.3 (3.4x) & 199.0 (3.0x) & 333.3 (4.5x) & 1.5 & 2206 & 1226.5 \\
+S4 & v2\_recompute & handwritten backward (PyTorch) & 120.4 (1.5x) & 58.2 (1.6x) & 392.8 (1.5x) & 571.4 (2.6x) & 0.7 & 3424 & 0.0 \\
+S5 & v3\_triton & Triton private-histogram forward & 39.2 (4.6x) & 19.8 (4.7x) & 135.0 (4.5x) & 151.4 (9.9x) & 2.1 & 3092 & 0.0 \\
+S6/S7 & v4\_triton & + Triton backward & 7.4 (24.5x) & 3.3 (28.2x) & 26.4 (23.0x) & 29.8 (50.0x) & 11.3 & 441 & 0.0 \\
+\bottomrule
+\end{tabular}
+\caption{Ablation, soft binning (Tesla T4)}
+\end{table}
