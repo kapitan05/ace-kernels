@@ -176,6 +176,12 @@ def test_output_check_small_for_correct_impl() -> None:
     assert row.checked_against == "reference"
     assert row.loss_rel_err is not None and row.loss_rel_err < 1e-5
     assert row.grad_rel_err is not None and row.grad_rel_err < 1e-4
+    # float64 truth: filled in, accurate, and the row is not flagged
+    assert row.grad_err_truth is not None and row.grad_err_truth < 1e-4
+    assert row.ref_grad_err_truth is not None
+    assert not any(
+        "WARNING" in line for line in verification_summary(rows_to_frame([row]))
+    )
 
 
 def test_output_check_flags_wrong_impl(monkeypatch: pytest.MonkeyPatch) -> None:

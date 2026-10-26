@@ -36,6 +36,10 @@ def _clean(df: pl.DataFrame) -> pl.DataFrame:
         ("loss_rel_err", pl.Float64),
         ("grad_rel_err", pl.Float64),
         ("checked_against", pl.String),
+        ("loss_err_truth", pl.Float64),
+        ("grad_err_truth", pl.Float64),
+        ("ref_loss_err_truth", pl.Float64),
+        ("ref_grad_err_truth", pl.Float64),
     ):  # runs before the output check
         if col not in df.columns:
             df = df.with_columns(pl.lit(None, dtype).alias(col))
@@ -83,8 +87,22 @@ def _sci(v: float | None) -> str | None:
     return None if v is None else f"{v:.1e}"
 
 
+def _flagged(r: dict[str, Any]) -> bool:
+    """Less accurate than the reference? Judged against float64 truth when available
+    (two fp32 results may differ while being equally accurate)."""
+    if r.get("grad_err_truth") is not None and r.get("ref_grad_err_truth") is not None:
+        worse = [
+            r[f"{q}_err_truth"] > max(2 * r[f"ref_{q}_err_truth"], 1e-5)
+            for q in ("loss", "grad")
+        ]
+        return any(worse)
+    return bool(
+        r["loss_rel_err"] > VERIFY_TOLERANCE or r["grad_rel_err"] > VERIFY_TOLERANCE
+    )
+
+
 def verification_summary(df: pl.DataFrame) -> list[str]:
-    """One line on the output check, plus a warning line per row above tolerance."""
+    """One line on the output check, plus a warning line per flagged row."""
     checked = df.filter(pl.col("loss_rel_err").is_not_null())
     if checked.height == 0:
         return ["Output check: not run for this experiment."]
@@ -93,18 +111,32 @@ def verification_summary(df: pl.DataFrame) -> list[str]:
     max_grad = checked.select(pl.col("grad_rel_err").max()).item()
     lines = [
         f"Output check (same input, vs {against}): {checked.height} rows, "
-        f"max loss rel err {max_loss:.1e}, max grad rel err {max_grad:.1e} "
-        f"(tolerance {VERIFY_TOLERANCE:.0e})."
+        f"max loss rel err {max_loss:.1e}, max grad rel err {max_grad:.1e}."
     ]
-    bad = checked.filter(
-        (pl.col("loss_rel_err") > VERIFY_TOLERANCE)
-        | (pl.col("grad_rel_err") > VERIFY_TOLERANCE)
-    )
-    for r in bad.iter_rows(named=True):
+    with_truth = checked.filter(pl.col("grad_err_truth").is_not_null())
+    if with_truth.height:
+        lines.append(
+            f"vs float64 truth ({with_truth.height} rows): max grad err "
+            f"{with_truth.select(pl.col('grad_err_truth').max()).item():.1e} "
+            f"(reference itself: up to "
+            f"{with_truth.select(pl.col('ref_grad_err_truth').max()).item():.1e}). "
+            "Flag: > 2x the reference's own error vs truth (and > 1e-5); without "
+            f"truth: > {VERIFY_TOLERANCE:.0e} vs reference."
+        )
+    for r in checked.iter_rows(named=True):
+        if not _flagged(r):
+            continue
+        truth = (
+            f"; vs truth loss {r['loss_err_truth']:.1e} grad {r['grad_err_truth']:.1e}"
+            f" (reference {r['ref_loss_err_truth']:.1e} /"
+            f" {r['ref_grad_err_truth']:.1e})"
+            if r.get("grad_err_truth") is not None
+            else ""
+        )
         lines.append(
             f"**WARNING** {r['shape']} {r['binning']} {r['impl']} {r['mode']}: "
-            f"loss err {r['loss_rel_err']:.1e}, grad err {r['grad_rel_err']:.1e} "
-            f"vs {r['checked_against']}"
+            f"vs {r['checked_against']} loss {r['loss_rel_err']:.1e} "
+            f"grad {r['grad_rel_err']:.1e}{truth}"
         )
     return lines
 

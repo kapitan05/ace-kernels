@@ -65,6 +65,13 @@ class Row(BaseModel):
     checked_against: str | None = None
     loss_rel_err: float | None = None
     grad_rel_err: float | None = None
+    # The same errors against a float64 truth (v2_recompute in float64, formula
+    # validated by gradcheck), and the reference's own errors against it: tells
+    # "less accurate" apart from "differently rounded" (both fp32).
+    loss_err_truth: float | None = None
+    grad_err_truth: float | None = None
+    ref_loss_err_truth: float | None = None
+    ref_grad_err_truth: float | None = None
 
 
 _POLARS_TYPES: dict[str, type[pl.DataType]] = {
@@ -94,11 +101,28 @@ FALLBACK_REFERENCE = "v2_recompute"
 
 @dataclass
 class Reference:
-    """Loss and input gradient of a trusted implementation, kept on the CPU."""
+    """Loss and input gradient of a trusted implementation, kept on the CPU.
+
+    ``truth_*``: float64 result on the same input (None if it did not fit);
+    ``ref_*_err_truth``: the reference's own relative errors against it.
+    """
 
     impl: str
     loss: torch.Tensor
     grad: torch.Tensor
+    truth_loss: torch.Tensor | None = None
+    truth_grad: torch.Tensor | None = None
+    ref_loss_err_truth: float | None = None
+    ref_grad_err_truth: float | None = None
+
+
+TRUTH_IMPL = "v2_recompute"  # evaluated in float64
+
+
+def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
+    """max |a - b| / max |b| (b: the trusted value)."""
+    diff = (a.double() - b.double()).abs().max()
+    return float(diff / b.double().abs().max().clamp_min(1e-12))
 
 
 def _loss_and_grad(
@@ -121,25 +145,51 @@ def compute_reference(
     spec = InputSpec(shape.batch, shape.channels, shape.spatial, seed=seed)
     x, y = make_inputs(spec, loss_config, device)
     x = x.to(getattr(torch, dtype))
+    ref: Reference | None = None
     for impl in ("reference", FALLBACK_REFERENCE):
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", UserWarning)
                 loss, grad = _loss_and_grad(impl, x, y, loss_config)
-            return Reference(impl, loss, grad)
+            ref = Reference(impl, loss, grad)
+            break
         except torch.OutOfMemoryError:
             release_memory(device)
-    return None
+    if ref is None:
+        return None
+    try:  # float64 truth on the same (already rounded) input values
+        leaf = x.detach().double().requires_grad_(True)
+        loss64 = ace_loss(leaf, y, loss_config, impl=TRUTH_IMPL)
+        (grad64,) = torch.autograd.grad(loss64.sum(), leaf)
+        ref.truth_loss, ref.truth_grad = loss64.detach().cpu(), grad64.cpu()
+        ref.ref_loss_err_truth = _rel(ref.loss, ref.truth_loss)
+        ref.ref_grad_err_truth = _rel(ref.grad, ref.truth_grad)
+    except torch.OutOfMemoryError:
+        pass  # rows then carry no truth comparison
+    release_memory(device)
+    return ref
 
 
-def _relative_errors(
-    impl: str, x: torch.Tensor, y: torch.Tensor, config: ACEConfig, ref: Reference
-) -> tuple[float, float]:
-    loss, grad = _loss_and_grad(impl, x, y, config)
-    grad = grad.float()
-    loss_err = (loss - ref.loss).abs().max() / ref.loss.abs().max().clamp_min(1e-12)
-    grad_err = (grad - ref.grad).abs().max() / ref.grad.abs().max().clamp_min(1e-12)
-    return float(loss_err), float(grad_err)
+def _check_output(
+    row: "Row",
+    impl: str,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    config: ACEConfig,
+    ref: Reference,
+) -> None:
+    """Fill the row's error columns (vs the reference, and vs float64 truth)."""
+    row.checked_against = ref.impl
+    row.ref_loss_err_truth = ref.ref_loss_err_truth
+    row.ref_grad_err_truth = ref.ref_grad_err_truth
+    if impl == ref.impl:
+        loss, grad = ref.loss, ref.grad
+    else:
+        loss, grad = _loss_and_grad(impl, x, y, config)
+    row.loss_rel_err, row.grad_rel_err = _rel(loss, ref.loss), _rel(grad, ref.grad)
+    if ref.truth_loss is not None and ref.truth_grad is not None:
+        row.loss_err_truth = _rel(loss, ref.truth_loss)
+        row.grad_err_truth = _rel(grad, ref.truth_grad)
 
 
 def _step_fn(
@@ -272,14 +322,8 @@ def measure_case(
                 row.peak_extra_bytes = _peak_extra_bytes(fn, device)
             _apply_timing(row, measure(fn, device, warmup=warmup, reps=reps), env)
             if reference is not None and not cuda_graph:  # untimed output check
-                row.checked_against = reference.impl
-                if impl == reference.impl:
-                    row.loss_rel_err = row.grad_rel_err = 0.0
-                else:
-                    del fn  # free the timed closure's buffers first
-                    row.loss_rel_err, row.grad_rel_err = _relative_errors(
-                        impl, x, y, loss_config, reference
-                    )
+                del fn  # free the timed closure's buffers first
+                _check_output(row, impl, x, y, loss_config, reference)
     except torch.OutOfMemoryError as exc:
         row.status, row.error = "oom", str(exc).splitlines()[0][:500]
     except Exception as exc:
