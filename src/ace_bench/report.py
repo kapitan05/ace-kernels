@@ -18,6 +18,8 @@ import matplotlib.pyplot as plt
 import polars as pl
 from matplotlib.ticker import LogLocator, NullFormatter, ScalarFormatter
 
+from ace_bench.measure import VERIFY_TOLERANCE
+
 # Validated categorical palette (dataviz skill reference instance), fixed order:
 # implementation i in the config always gets slot i.
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]
@@ -30,6 +32,13 @@ def _clean(df: pl.DataFrame) -> pl.DataFrame:
     """Peak memory of a CUDA-graph replay is not meaningful (older runs logged 0)."""
     if "allocated_after_bytes" not in df.columns:  # runs before the leak check
         df = df.with_columns(pl.lit(None, pl.Int64).alias("allocated_after_bytes"))
+    for col, dtype in (
+        ("loss_rel_err", pl.Float64),
+        ("grad_rel_err", pl.Float64),
+        ("checked_against", pl.String),
+    ):  # runs before the output check
+        if col not in df.columns:
+            df = df.with_columns(pl.lit(None, dtype).alias(col))
     return df.with_columns(
         pl.when(pl.col("cuda_graph"))
         .then(None)
@@ -61,7 +70,43 @@ def _table(df: pl.DataFrame) -> pl.DataFrame:
         (pl.col("saved_extra_bytes") / MiB).round(1).alias("saved MiB"),
         (pl.col("peak_extra_bytes") / MiB).round(1).alias("peak MiB"),
         (pl.col("allocated_after_bytes") / MiB).round(1).alias("left allocated MiB"),
+        pl.col("loss_rel_err")
+        .map_elements(_sci, return_dtype=pl.String)
+        .alias("loss err"),
+        pl.col("grad_rel_err")
+        .map_elements(_sci, return_dtype=pl.String)
+        .alias("grad err"),
     )
+
+
+def _sci(v: float | None) -> str | None:
+    return None if v is None else f"{v:.1e}"
+
+
+def verification_summary(df: pl.DataFrame) -> list[str]:
+    """One line on the output check, plus a warning line per row above tolerance."""
+    checked = df.filter(pl.col("loss_rel_err").is_not_null())
+    if checked.height == 0:
+        return ["Output check: not run for this experiment."]
+    against = ", ".join(sorted(set(checked["checked_against"].drop_nulls())))
+    max_loss = checked.select(pl.col("loss_rel_err").max()).item()
+    max_grad = checked.select(pl.col("grad_rel_err").max()).item()
+    lines = [
+        f"Output check (same input, vs {against}): {checked.height} rows, "
+        f"max loss rel err {max_loss:.1e}, max grad rel err {max_grad:.1e} "
+        f"(tolerance {VERIFY_TOLERANCE:.0e})."
+    ]
+    bad = checked.filter(
+        (pl.col("loss_rel_err") > VERIFY_TOLERANCE)
+        | (pl.col("grad_rel_err") > VERIFY_TOLERANCE)
+    )
+    for r in bad.iter_rows(named=True):
+        lines.append(
+            f"**WARNING** {r['shape']} {r['binning']} {r['impl']} {r['mode']}: "
+            f"loss err {r['loss_rel_err']:.1e}, grad err {r['grad_rel_err']:.1e} "
+            f"vs {r['checked_against']}"
+        )
+    return lines
 
 
 def _cell(v: Any) -> str:
@@ -233,6 +278,7 @@ def write_summary(df: pl.DataFrame, meta: dict[str, Any], out: Path) -> str:
         "",
     ]
     df = _clean(df)
+    lines += [*verification_summary(df), ""]
     tex = []
     for binning, mode, sub in _groups(df):
         table = _table(sub)

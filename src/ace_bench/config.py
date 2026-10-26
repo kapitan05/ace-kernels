@@ -43,6 +43,8 @@ class BenchConfig(BaseModel):
     # run each (shape, binning, impl) group in a fresh process, so a leak or a
     # broken CUDA context in one group cannot affect the others
     isolate: bool = True
+    # compare every row's loss and gradient with the reference on the same input
+    verify: bool = True
     warmup: int = Field(default=3, ge=0)
     reps: int = Field(default=10, ge=1)
     seed: int = 0

@@ -5,12 +5,13 @@ from pathlib import Path
 
 import polars as pl
 import pytest
+import torch
 
 from ace_bench import calculator
 from ace_bench.config import BenchConfig, ShapeSpec
 from ace_bench.env import REPO_ROOT, collect_env, peak_bandwidth_gbps
-from ace_bench.measure import Row, measure_case, rows_to_frame
-from ace_bench.report import write_summary
+from ace_bench.measure import Row, compute_reference, measure_case, rows_to_frame
+from ace_bench.report import verification_summary, write_summary
 from ace_bench.run import Job, run_isolated
 from ace_bench.timing import measure
 from ace_kernels import ACEConfig, get_impl
@@ -158,3 +159,62 @@ def test_crashed_worker_becomes_error_rows() -> None:
     rows = run_isolated(_job("does_not_exist"))  # KeyError in the worker
     assert [r.status for r in rows] == ["error"]
     assert "worker exited" in (rows[0].error or "")
+
+
+def test_output_check_small_for_correct_impl() -> None:
+    env = collect_env("cpu")
+    config = ACEConfig(binning="soft", to_onehot_y=True)
+    ref = compute_reference(TINY, config, "cpu")
+    assert ref is not None and ref.impl == "reference"
+    row = measure_case(
+        "v1_clean", TINY, config, "fwd_bwd", env, warmup=0, reps=1, reference=ref
+    )
+    assert row.checked_against == "reference"
+    assert row.loss_rel_err is not None and row.loss_rel_err < 1e-5
+    assert row.grad_rel_err is not None and row.grad_rel_err < 1e-4
+
+
+def test_output_check_flags_wrong_impl(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ace_kernels.impls.reference import reference_ace
+    from ace_kernels.registry import _REGISTRY, ImplSpec
+
+    def off_by_one_percent(
+        x: torch.Tensor, y: torch.Tensor, c: ACEConfig
+    ) -> torch.Tensor:
+        return reference_ace(x, y, c) * 1.01
+
+    spec = ImplSpec(
+        "_broken",
+        off_by_one_percent,
+        frozenset({"hard", "soft"}),
+        frozenset({"cpu"}),
+        "test",
+    )
+    monkeypatch.setitem(_REGISTRY, "_broken", spec)
+    env = collect_env("cpu")
+    config = ACEConfig(binning="hard", to_onehot_y=True)
+    ref = compute_reference(TINY, config, "cpu")
+    row = measure_case(
+        "_broken", TINY, config, "fwd_bwd", env, warmup=0, reps=1, reference=ref
+    )
+    assert row.loss_rel_err == pytest.approx(0.01, rel=1e-3)
+    df = rows_to_frame([row])
+    assert any("WARNING" in line for line in verification_summary(df))
+
+
+def test_reference_falls_back_when_it_runs_out_of_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ace_bench.measure as measure_mod
+    from ace_kernels import ace_loss as real
+
+    def oom_for_reference(
+        x: torch.Tensor, y: torch.Tensor, c: ACEConfig, impl: str = "reference"
+    ) -> torch.Tensor:
+        if impl == "reference":
+            raise torch.OutOfMemoryError("simulated")
+        return real(x, y, c, impl=impl)
+
+    monkeypatch.setattr(measure_mod, "ace_loss", oom_for_reference)
+    ref = compute_reference(TINY, ACEConfig(binning="soft", to_onehot_y=True), "cpu")
+    assert ref is not None and ref.impl == "v2_recompute"

@@ -4,6 +4,7 @@ import gc
 import traceback
 import warnings
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Literal
 
 import polars as pl
@@ -58,6 +59,11 @@ class Row(BaseModel):
     # the baseline; growth across rows means a leak (Sprint 3 run 4 lost 38 rows
     # to ~10 GiB leaked from earlier rows).
     allocated_after_bytes: int | None = None
+    # Output check at benchmark size, against `checked_against` on the same input:
+    # |L - L_ref| / |L_ref| and max|g - g_ref| / max|g_ref| (untimed).
+    checked_against: str | None = None
+    loss_rel_err: float | None = None
+    grad_rel_err: float | None = None
 
 
 _POLARS_TYPES: dict[str, type[pl.DataType]] = {
@@ -76,6 +82,57 @@ def rows_to_frame(rows: list[Row]) -> pl.DataFrame:
         base = next(a for a in args if a is not type(None))
         schema[name] = _POLARS_TYPES.get(getattr(base, "__name__", "str"), pl.String)
     return pl.DataFrame([r.model_dump() for r in rows], schema=schema)
+
+
+# Above this relative error a benchmark row is flagged: fp32 summation-order noise
+# is <= 1e-5 (tests); real bugs were >= 1e-2 (Sprint 1 mutants).
+VERIFY_TOLERANCE = 1e-4
+# Validated stand-in when the reference itself runs out of memory (e.g. soft 288^3).
+FALLBACK_REFERENCE = "v2_recompute"
+
+
+@dataclass
+class Reference:
+    """Loss and input gradient of a trusted implementation, kept on the CPU."""
+
+    impl: str
+    loss: torch.Tensor
+    grad: torch.Tensor
+
+
+def _loss_and_grad(
+    impl: str, x: torch.Tensor, y: torch.Tensor, config: ACEConfig
+) -> tuple[torch.Tensor, torch.Tensor]:
+    leaf = x.detach().requires_grad_(True)
+    loss = ace_loss(leaf, y, config, impl=impl)
+    (grad,) = torch.autograd.grad(loss.sum(), leaf)
+    return loss.detach().cpu(), grad.cpu()
+
+
+def compute_reference(
+    shape: ShapeSpec, loss_config: ACEConfig, device: str, seed: int = 0
+) -> Reference | None:
+    """The reference's result on the benchmark input (fallback: v2_recompute)."""
+    spec = InputSpec(shape.batch, shape.channels, shape.spatial, seed=seed)
+    x, y = make_inputs(spec, loss_config, device)
+    for impl in ("reference", FALLBACK_REFERENCE):
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                loss, grad = _loss_and_grad(impl, x, y, loss_config)
+            return Reference(impl, loss, grad)
+        except torch.OutOfMemoryError:
+            release_memory(device)
+    return None
+
+
+def _relative_errors(
+    impl: str, x: torch.Tensor, y: torch.Tensor, config: ACEConfig, ref: Reference
+) -> tuple[float, float]:
+    loss, grad = _loss_and_grad(impl, x, y, config)
+    loss_err = (loss - ref.loss).abs().max() / ref.loss.abs().max().clamp_min(1e-12)
+    grad_err = (grad - ref.grad).abs().max() / ref.grad.abs().max().clamp_min(1e-12)
+    return float(loss_err), float(grad_err)
 
 
 def _step_fn(
@@ -149,6 +206,7 @@ def measure_case(
     warmup: int = 3,
     reps: int = 10,
     seed: int = 0,
+    reference: Reference | None = None,
 ) -> Row:
     device = env.device
     spec = InputSpec(shape.batch, shape.channels, shape.spatial, seed=seed)
@@ -203,6 +261,15 @@ def measure_case(
             if not cuda_graph:  # replaying a graph allocates nothing: peak meaningless
                 row.peak_extra_bytes = _peak_extra_bytes(fn, device)
             _apply_timing(row, measure(fn, device, warmup=warmup, reps=reps), env)
+            if reference is not None and not cuda_graph:  # untimed output check
+                row.checked_against = reference.impl
+                if impl == reference.impl:
+                    row.loss_rel_err = row.grad_rel_err = 0.0
+                else:
+                    del fn  # free the timed closure's buffers first
+                    row.loss_rel_err, row.grad_rel_err = _relative_errors(
+                        impl, x, y, loss_config, reference
+                    )
     except torch.OutOfMemoryError as exc:
         row.status, row.error = "oom", str(exc).splitlines()[0][:500]
     except Exception as exc:

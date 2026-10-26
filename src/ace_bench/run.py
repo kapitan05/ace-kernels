@@ -24,7 +24,13 @@ from pydantic import BaseModel
 
 from ace_bench.config import BenchConfig, ShapeSpec
 from ace_bench.env import REPO_ROOT, EnvInfo, collect_env
-from ace_bench.measure import Row, measure_case, release_memory, rows_to_frame
+from ace_bench.measure import (
+    Row,
+    compute_reference,
+    measure_case,
+    release_memory,
+    rows_to_frame,
+)
 from ace_bench.report import write_summary
 from ace_bench.tracking import mirror_run
 from ace_kernels.config import Binning
@@ -39,7 +45,12 @@ def _fmt(row: Row) -> str:
         if row.peak_extra_bytes is not None
         else ""
     )
-    return f"{row.p50_ms:9.3f} ms  {bw}  {mem}  kernels={row.kernels_per_call}"
+    err = (
+        f"  err loss {row.loss_rel_err:.0e} grad {row.grad_rel_err:.0e}"
+        if row.loss_rel_err is not None and row.grad_rel_err is not None
+        else ""
+    )
+    return f"{row.p50_ms:9.3f} ms  {bw}  {mem}  kernels={row.kernels_per_call}{err}"
 
 
 class Job(BaseModel):
@@ -56,6 +67,12 @@ def run_group(job: Job) -> list[Row]:
     config = job.config
     loss_config = config.loss.model_copy(update={"binning": job.binning})
     graph_options = [False, True] if config.cuda_graph else [False]
+    reference = (
+        compute_reference(job.shape, loss_config, config.device, config.seed)
+        if config.verify
+        else None
+    )
+    release_memory(config.device)
     rows = []
     for mode, graphed in itertools.product(config.modes, graph_options):
         start = time.perf_counter()
@@ -69,6 +86,7 @@ def run_group(job: Job) -> list[Row]:
             warmup=config.warmup,
             reps=config.reps,
             seed=config.seed,
+            reference=reference,
         )
         release_memory(config.device)
         if config.device == "cuda":
