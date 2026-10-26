@@ -56,6 +56,15 @@ module = ["ace_bench.*", "tests.test_sync"]
 disallow_untyped_calls = false
 
 [[tool.mypy.overrides]]
+# Triton kernels: @triton.jit / autotune are untyped; tl ops have no stubs
+module = ["ace_kernels.kernels.*"]
+disallow_untyped_decorators = false
+disallow_untyped_calls = false
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_any_generics = false
+
+[[tool.mypy.overrides]]
 module = ["monai.*", "triton", "triton.*"]
 ignore_missing_imports = true
 

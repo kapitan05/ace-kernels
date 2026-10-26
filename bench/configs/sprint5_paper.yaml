@@ -1,0 +1,20 @@
+# Sprint 5: Triton private-histogram forward (hard binning) vs best PyTorch.
+name: sprint5-paper
+group: sprint5-triton-fwd
+hypothesis: >-
+  Replacing the contended scatter_add with per-block private histograms removes
+  the forward's main cost: v3_triton's forward runs near the bandwidth floor
+  (>30% of peak) and fwd+bwd becomes dominated by v2's PyTorch backward, which
+  Sprint 6 then moves to Triton. Memory stays at v2_recompute's level.
+device: cuda
+impls: [reference, v1_clean_compile, v2_recompute, v3_triton]
+binnings: [hard]
+modes: [fwd, fwd_bwd]
+cuda_graph: true
+warmup: 3
+reps: 10
+shapes:
+  - {name: kits23, batch: 2, channels: 4, spatial: [128, 128, 128]}
+  - {name: acdc17, batch: 2, channels: 4, spatial: [256, 256, 16]}
+  - {name: brats21, batch: 2, channels: 4, spatial: [224, 224, 144]}
+  - {name: amos22, batch: 2, channels: 16, spatial: [176, 176, 64]}

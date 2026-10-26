@@ -9,6 +9,9 @@ import torch
 
 from ace_kernels import ACEConfig, ace_loss
 from ace_kernels.cases import InputSpec, make_inputs
+from ace_kernels.config import Binning
+from ace_kernels.kernels import HAS_TRITON
+from tests.helpers import skip_unless_supported
 
 pytestmark = [
     pytest.mark.cuda,
@@ -16,13 +19,18 @@ pytestmark = [
 ]
 
 
-GRAPH_SAFE = ["v1_clean", "v2_recompute", "v2_grad_in_fwd"]
+GRAPH_SAFE = ["v1_clean", "v2_recompute", "v2_grad_in_fwd"] + (
+    ["v3_triton"] if HAS_TRITON else []
+)
 
 
 @pytest.mark.parametrize("impl", GRAPH_SAFE)
 @pytest.mark.parametrize("binning", ["hard", "soft"])
 @pytest.mark.parametrize("include_background", [True, False])
-def test_has_no_host_sync(impl: str, binning: str, include_background: bool) -> None:
+def test_has_no_host_sync(
+    impl: str, binning: Binning, include_background: bool
+) -> None:
+    skip_unless_supported(impl, binning, "cuda", "paper-3d-hard")
     config = ACEConfig.model_validate(
         {
             "binning": binning,
@@ -62,7 +70,8 @@ def test_reference_soft_is_not_graph_capturable() -> None:
 
 @pytest.mark.parametrize("impl", GRAPH_SAFE)
 @pytest.mark.parametrize("binning", ["hard", "soft"])
-def test_captures_in_cuda_graph(impl: str, binning: str) -> None:
+def test_captures_in_cuda_graph(impl: str, binning: Binning) -> None:
+    skip_unless_supported(impl, binning, "cuda", "paper-3d-hard")
     """No host<->device copies or syncs: fwd+bwd can be captured and replayed."""
     config = ACEConfig.model_validate(
         {"binning": binning, "to_onehot_y": True, "weight": (1.0, 2.0, 0.5, 1.0)}

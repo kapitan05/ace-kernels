@@ -18,7 +18,8 @@ assert arch in torch.cuda.get_arch_list(), (
 PY
 
 echo "== Correctness gate (CPU + CUDA)"
-uv run pytest tests/ -q -p no:cacheprovider
+# PYTEST_ARGS narrows the gate for quick dev jobs (default: the whole suite)
+uv run pytest ${PYTEST_ARGS:-tests/} -q -p no:cacheprovider
 
 WANDB=""
 if [[ -n "${WANDB_API_KEY:-}" ]]; then WANDB="--wandb"; fi

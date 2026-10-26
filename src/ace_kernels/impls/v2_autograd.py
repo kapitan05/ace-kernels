@@ -21,6 +21,7 @@ from typing import Any, Literal
 import torch
 
 from ace_kernels.binning import (
+    BinStats,
     bin_difference,
     bin_stats,
     hard_bin_index,
@@ -37,13 +38,24 @@ from ace_kernels.config import ACEConfig
 from ace_kernels.registry import register
 
 Mode = Literal["recompute", "grad_in_fwd"]
+# Where the forward's per-bin sums are computed: PyTorch scatter_add, or the
+# Triton private-histogram kernel (v3; hard binning, float32 CUDA).
+StatsBackend = Literal["torch", "triton"]
+
+
+def _stats(prep: Prepared, config: ACEConfig, backend: StatsBackend) -> BinStats:
+    if backend == "triton":
+        from ace_kernels.kernels.hard_hist import hard_stats_triton
+
+        return hard_stats_triton(prep, config)
+    return bin_stats(prep, config)
 
 
 def _bin_coefficients(
-    prep: Prepared, config: ACEConfig
+    prep: Prepared, config: ACEConfig, backend: StatsBackend = "torch"
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Per-class error ``f`` [B, C] and the backward's per-bin ``coef``, ``d``."""
-    stats = bin_stats(prep, config)
+    stats = _stats(prep, config, backend)
     d = bin_difference(stats)
     f = torch.nanmean(per_bin_error(stats), dim=-1)
     nonempty = ~stats.empty
@@ -136,9 +148,10 @@ class _ACELoss(torch.autograd.Function):
         target: torch.Tensor,
         config: ACEConfig,
         mode: Mode,
+        backend: StatsBackend,
     ) -> torch.Tensor:
         prep = prepare(input, target, config, keep_labels=True)
-        f, coef, d = _bin_coefficients(prep, config)
+        f, coef, d = _bin_coefficients(prep, config, backend)
         loss = reduce_classes(f, prep, config)
         ctx.config = config
         ctx.precomputed = mode == "grad_in_fwd" and config.reduction != "none"
@@ -153,16 +166,20 @@ class _ACELoss(torch.autograd.Function):
     def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[Any, ...]:
         if ctx.precomputed:
             (unit_grad,) = ctx.saved_tensors
-            return grad_output * unit_grad, None, None, None
+            return grad_output * unit_grad, None, None, None, None
         input, target, coef, d = ctx.saved_tensors
         grad = _input_grad(input, target, ctx.config, coef, d, grad_output)
-        return grad, None, None, None
+        return grad, None, None, None, None
 
 
 def _apply(
-    input: torch.Tensor, target: torch.Tensor, config: ACEConfig, mode: Mode
+    input: torch.Tensor,
+    target: torch.Tensor,
+    config: ACEConfig,
+    mode: Mode,
+    backend: StatsBackend = "torch",
 ) -> torch.Tensor:
-    loss: torch.Tensor = _ACELoss.apply(input, target, config, mode)
+    loss: torch.Tensor = _ACELoss.apply(input, target, config, mode, backend)
     return loss
 
 
