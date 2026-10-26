@@ -159,10 +159,21 @@ def finalize(
     return reduce_classes(torch.nanmean(per_bin_error, dim=-1), prep, config)
 
 
-def reduce_classes(f: torch.Tensor, prep: Prepared, config: ACEConfig) -> torch.Tensor:
-    """``[B, C]`` per-class error -> loss: empty-class mask, weights, reduction."""
+def reduce_classes(
+    f: torch.Tensor,
+    prep: Prepared,
+    config: ACEConfig,
+    present: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``[B, C]`` per-class error -> loss: empty-class mask, weights, reduction.
+
+    ``present`` ([B, C] bool, class occurs in the target) can be passed when known,
+    e.g. from the bin statistics, to skip ``nonempty_classes``' label scatter.
+    """
     if config.ignore_empty_classes:
-        f = f * nonempty_classes(prep).to(f.dtype)
+        if present is None:
+            present = nonempty_classes(prep)
+        f = f * present.to(f.dtype)
     n_ch = f.shape[1]
     if config.weight is not None and n_ch != 1:
         # checked on the Python config values: no device -> host sync

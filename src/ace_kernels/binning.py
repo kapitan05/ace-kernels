@@ -124,6 +124,15 @@ def bin_stats(prep: Prepared, config: ACEConfig) -> BinStats:
     )
 
 
+def class_present(stats: BinStats) -> torch.Tensor:
+    """``[B, C]`` bool: class occurs in the target, from the per-bin target sums.
+
+    Each voxel's bin weights sum to 1, so ``sum_k G_k = sum_i y_i``: identical to
+    the reference's ``target.sum() > 0``, without a (contended) scatter over labels.
+    """
+    return stats.sum_gt.sum(-1) > 0
+
+
 def bin_difference(stats: BinStats) -> torch.Tensor:
     """``mean_p - mean_gt`` per bin (0 for empty bins), computed like the reference
     (two divisions, then subtract) so its sign at exact ties matches."""

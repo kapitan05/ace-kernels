@@ -24,6 +24,7 @@ from ace_kernels.binning import (
     BinStats,
     bin_difference,
     bin_stats,
+    class_present,
     hard_bin_index,
     per_bin_error,
 )
@@ -54,8 +55,8 @@ def _stats(prep: Prepared, config: ACEConfig, backend: StatsBackend) -> BinStats
 
 def _bin_coefficients(
     prep: Prepared, config: ACEConfig, backend: StatsBackend = "torch"
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Per-class error ``f`` [B, C] and the backward's per-bin ``coef``, ``d``."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-class error ``f`` [B, C], class presence, and the per-bin ``coef``, ``d``."""
     stats = _stats(prep, config, backend)
     d = bin_difference(stats)
     f = torch.nanmean(per_bin_error(stats), dim=-1)
@@ -63,7 +64,7 @@ def _bin_coefficients(
     k_ne = nonempty.sum(-1, keepdim=True).clamp_min(1).to(d.dtype)
     safe_w = torch.where(nonempty, stats.weight, torch.ones_like(stats.weight))
     coef = torch.where(nonempty, torch.sign(d) / (k_ne * safe_w), torch.zeros_like(d))
-    return f, coef, d
+    return f, class_present(stats), coef, d
 
 
 def _true_target(prep: Prepared) -> torch.Tensor:
@@ -115,24 +116,29 @@ def _upstream(
     grad_output: torch.Tensor,
     device: torch.device,
     dtype: torch.dtype,
+    present: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``dL/df_bc`` [B, C] from mask, weights and reduction (via autograd)."""
     with torch.enable_grad():
         f_var = torch.zeros(f_shape, device=device, dtype=dtype, requires_grad=True)
-        out = reduce_classes(f_var, prep, config)
+        out = reduce_classes(f_var, prep, config, present)
         (g,) = torch.autograd.grad(out, f_var, grad_output.to(dtype))
     return g
 
 
 def _reduction_jacobian(
-    f: torch.Tensor, prep: Prepared, config: ACEConfig
+    f: torch.Tensor,
+    prep: Prepared,
+    config: ACEConfig,
+    present: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``[B, C]`` d(sum of loss outputs)/d f_bc. The mask/weights/reduction step is
     linear and acts per (b, c), so ``dL/df = grad_output * this`` (scalar
     grad_output for mean/sum, elementwise for "none")."""
     with torch.enable_grad():
         f_var = torch.zeros_like(f, requires_grad=True)
-        (jac,) = torch.autograd.grad(reduce_classes(f_var, prep, config).sum(), f_var)
+        out = reduce_classes(f_var, prep, config, present)
+        (jac,) = torch.autograd.grad(out.sum(), f_var)
     return jac
 
 
@@ -158,9 +164,12 @@ def _input_grad(
     coef: torch.Tensor,
     d: torch.Tensor,
     grad_output: torch.Tensor,
+    present: torch.Tensor | None = None,
 ) -> torch.Tensor:
     prep = prepare(input, target, config, keep_labels=True)
-    g = _upstream(coef.shape[:2], prep, config, grad_output, input.device, coef.dtype)
+    g = _upstream(
+        coef.shape[:2], prep, config, grad_output, input.device, coef.dtype, present
+    )
     grad_p = g.unsqueeze(-1) * _df_dprobs(prep, coef, d, config)  # [B, C', N]
     if grad_p.shape[1] != input.shape[1]:  # background channel was dropped
         grad_p = torch.cat((torch.zeros_like(grad_p[:, :1]), grad_p), dim=1)
@@ -179,18 +188,20 @@ class _ACELoss(torch.autograd.Function):
         backend: StatsBackend,
     ) -> torch.Tensor:
         prep = prepare(input, target, config, keep_labels=True)
-        f, coef, d = _bin_coefficients(prep, config, backend)
-        loss = reduce_classes(f, prep, config)
+        f, present, coef, d = _bin_coefficients(prep, config, backend)
+        loss = reduce_classes(f, prep, config, present)
         ctx.config = config
         ctx.mode = mode
         ctx.precomputed = mode == "grad_in_fwd" and config.reduction != "none"
         if mode == "triton_bwd":  # tiny saves only: coef and the reduction's jacobian
-            ctx.save_for_backward(input, coef, _reduction_jacobian(f, prep, config))
+            jac = _reduction_jacobian(f, prep, config, present)
+            ctx.save_for_backward(input, coef, jac)
         elif ctx.precomputed:  # gradient for upstream 1, scaled in backward
             unit = torch.ones((), device=loss.device, dtype=loss.dtype)
-            ctx.save_for_backward(_input_grad(input, target, config, coef, d, unit))
+            grad = _input_grad(input, target, config, coef, d, unit, present)
+            ctx.save_for_backward(grad)
         else:
-            ctx.save_for_backward(input, target, coef, d)
+            ctx.save_for_backward(input, target, coef, d, present)
         return loss
 
     @staticmethod
@@ -202,8 +213,8 @@ class _ACELoss(torch.autograd.Function):
         if ctx.precomputed:
             (unit_grad,) = ctx.saved_tensors
             return grad_output * unit_grad, None, None, None, None
-        input, target, coef, d = ctx.saved_tensors
-        grad = _input_grad(input, target, ctx.config, coef, d, grad_output)
+        input, target, coef, d, present = ctx.saved_tensors
+        grad = _input_grad(input, target, ctx.config, coef, d, grad_output, present)
         return grad, None, None, None, None
 
 

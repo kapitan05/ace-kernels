@@ -140,3 +140,20 @@ def test_v4_sigmoid_single_channel() -> None:
         leaf = x.clone().requires_grad_(True)
         grads.append(torch.autograd.grad(ace_loss(leaf, y, config, impl=impl), leaf)[0])
     torch.testing.assert_close(grads[1], grads[0], rtol=1e-4, atol=1e-8)
+
+
+def test_large_volume_grid() -> None:
+    """Regression: > 65535 voxel blocks (256^3) failed with "invalid argument" when
+    the voxel blocks were on grid axis 1 (limit 65535)."""
+    from ace_kernels import ace_loss
+    from ace_kernels.kernels.hard_hist import hard_stats_triton
+
+    config = ACEConfig(binning="hard", to_onehot_y=True)
+    x, y = make_inputs(InputSpec(1, 2, (256, 256, 256), seed=1), config, "cuda")
+    prep = prepare(x, y, config, keep_labels=True)
+    torch.testing.assert_close(
+        hard_stats_triton(prep, config).weight, hard_stats(prep, config).weight
+    )
+    leaf = x.clone().requires_grad_(True)
+    (grad,) = torch.autograd.grad(ace_loss(leaf, y, config, impl="v4_triton"), leaf)
+    assert torch.isfinite(grad).all()

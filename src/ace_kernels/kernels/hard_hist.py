@@ -43,8 +43,10 @@ def _hard_hist_kernel(
     USE_LABELS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    b = tl.program_id(0)
-    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    # voxel blocks on grid axis 0 (up to 2^31 - 1 programs); axis 1 is limited to
+    # 65535, which 256^3 volumes exceed (measured: "invalid argument" on a T4)
+    b = tl.program_id(1)
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     valid = offs < N
     bins = tl.arange(0, KP)
     bin_ok = bins < K
@@ -88,7 +90,7 @@ def hard_stats_triton(prep: Prepared, config: ACEConfig) -> BinStats:
     edges = hard_edges(k, p.device).contiguous()
 
     def grid(meta: dict[str, int]) -> tuple[int, int]:
-        return (b, triton.cdiv(n, meta["BLOCK"]))
+        return (triton.cdiv(n, meta["BLOCK"]), b)
 
     _hard_hist_kernel[grid](
         p,

@@ -44,8 +44,10 @@ def _hard_bwd_kernel(
     ACT: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    b = tl.program_id(0)
-    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    # voxel blocks on grid axis 0 (up to 2^31 - 1 programs); axis 1 is limited to
+    # 65535, which 256^3 volumes exceed (measured: "invalid argument" on a T4)
+    b = tl.program_id(1)
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     valid = offs < N
     chan = tl.arange(0, CP)
     chan_ok = chan < C
@@ -107,7 +109,7 @@ def hard_input_grad_triton(
     dx = torch.empty_like(probs)
 
     def grid(meta: dict[str, int]) -> tuple[int, int]:
-        return (b, triton.cdiv(n, meta["BLOCK"]))
+        return (triton.cdiv(n, meta["BLOCK"]), b)
 
     _hard_bwd_kernel[grid](
         probs,

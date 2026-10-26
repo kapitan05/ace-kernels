@@ -103,7 +103,8 @@ def test_recompute_saves_only_per_bin_stats(binning: Binning) -> None:
     _, stats = measure_saved_tensors(
         lambda: ace_loss(x, y, config, impl="v2_recompute"), exclude=[x, y]
     )
-    assert stats.extra_bytes == 2 * b * c * k * 4  # coef and d, float32 [B, C, K]
+    # coef and d (float32 [B, C, K]) + class presence (bool [B, C])
+    assert stats.extra_bytes == 2 * b * c * k * 4 + b * c
 
 
 @pytest.mark.parametrize("binning", ["hard", "soft"])
@@ -151,3 +152,17 @@ def test_reduction_jacobian_matches_autograd_upstream(name: str) -> None:
         shortcut = _reduction_jacobian(f, prep, config) * grad_output
     expected = _upstream(f.shape, prep, config, grad_output, f.device, f.dtype)
     torch.testing.assert_close(shortcut, expected, rtol=1e-12, atol=1e-15)
+
+
+def test_class_presence_from_stats_matches_target_sum() -> None:
+    """present = sum_k G_k > 0 must equal the reference's target.sum() > 0."""
+    from ace_kernels.binning import bin_stats, class_present
+    from ace_kernels.cases import CASES
+    from ace_kernels.common import nonempty_classes, prepare
+
+    for case in CASES:
+        x, y = make_inputs(case.spec, case.config)
+        for keep_labels in (True, False):
+            prep = prepare(x, y, case.config, keep_labels=keep_labels)
+            stats = bin_stats(prep, case.config)
+            assert torch.equal(class_present(stats), nonempty_classes(prep)), case.name

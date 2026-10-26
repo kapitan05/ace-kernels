@@ -100,5 +100,5 @@ gradient through the other channels' probabilities.
 |---|---|
 | reference, hard | 3× input (int64 bin index 2×, softmax output 1×) |
 | reference, soft | 11× input |
-| v2_recompute | `coef`, `d`: 2 · B·C·K floats (e.g. 640 B at B=2, C=4, K=20) |
+| v2_recompute | `coef`, `d`: 2 · B·C·K floats + class presence B·C bools (648 B at B=2, C=4, K=20) |
 | v2_grad_in_fwd | the input gradient (1× input), backward only scales it |
