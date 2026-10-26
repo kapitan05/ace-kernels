@@ -296,3 +296,60 @@ Memory headroom (2 x 4 x V^3, soft, fwd+bwd):
 3. Time: v2 is 1.1-1.2x slower than v1_clean (recompute pass) and ~2x slower than
    v1_clean_compile; the forward still uses the contended scatter.
 4. v2_grad_in_fwd has no advantage (same time, keeps 1x input): dropped from now on.
+
+## Sprints 5+6: Triton kernels, hard binning (2026-10-26)
+
+**Done**
+- `kernels/hard_hist.py` (Sprint 5): per-block private histograms; each program bins
+  a block of voxels for every channel against the reference's edges (bucketize
+  semantics) and issues one atomic add per bin and statistic. `v3_triton` = v2
+  backward + this forward.
+- `kernels/hard_bwd.py` (Sprint 6): one pass over `[C, BLOCK]` tiles: re-bin, gather
+  `coef`, softmax/sigmoid backward across channels in registers. `v4_triton` =
+  Triton forward + Triton backward; saves input, `coef`, presence, `[B, C]` jacobian.
+- Class presence from the bin statistics (`sum_k G_k > 0 == target.sum() > 0`).
+- Tests (GPU): counts and sum_y exactly equal to PyTorch; sum_p vs a float64 truth
+  (within 1e-5, never less accurate than scatter_add); v4 gradient == v2; golden,
+  sync, graph capture; 256^3 grid regression. Gate on T4: 973 passed.
+
+**Bugs found on the GPU** (each fixed + regression test)
+1. Dev run 1: my test fed raw single-channel logits (softmax is ignored for one
+   channel) -> out-of-range bins -> device assert poisoned the CUDA context.
+2. Dev run 2: sum_p differed from scatter_add by up to 4.9e-5 relative at 1e5
+   voxels per slice. Not a bug: fp32 summation order; vs float64 the kernel (tree
+   sums per block) is at least as accurate as scatter_add (sequential atomics).
+3. Run 1: kernels failed at >= 256^3 ("invalid argument"): voxel blocks on grid axis
+   1, limited to 65535. Moved to axis 0.
+4. Run 1 profile: 51% of v4 time was `nonempty_classes`' scatter of B*N labels into
+   B*C counters (same contention, outside the kernels). Replaced by the presence
+   from bin stats: v4 kits23 12.1 -> 4.9 ms.
+
+### Results: Tesla T4, commit dc02925 (`results/kaggle/dc029258d7b6-run-sprint56/`)
+
+fwd+bwd p50 ms (speedup vs reference), all 128 rows ok, no leaks:
+
+| shape | reference | v1_clean_compile | v2_recompute | v3_triton | **v4_triton** |
+|---|---|---|---|---|---|
+| kits23 | 99.5 | 19.0 (5.2x) | 38.2 | 10.4 (9.6x) | **4.86 (20.5x)** |
+| acdc17 | 50.0 | 9.6 | 18.9 | 5.2 | **2.40 (20.8x)** |
+| brats21 | 342 | 66.8 | 140 | 36.0 | **17.2 (19.9x)** |
+| amos22 | 794 | 108 | 232 | 41.9 | **20.4 (39x)** |
+
+- % of peak bandwidth (fwd+bwd): reference 0.3-0.8, v1_clean_compile 2.4-4.4,
+  **v4 12.7-17.5** (constant 16-17% from 128^3 to 288^3).
+- Peak memory (fwd+bwd, isolated call): v4 is **2.5x below the reference** and
+  ~equal to one input-sized tensor (kits23 320 -> 128 MiB; brats21 1106 -> 441;
+  288^3: 1.46 GiB vs 2.9 for v1_clean_compile, 5.7 for v2). Saved for backward: 0.
+- Forward alone: v3/v4 3.3 ms vs reference 69 ms (kits23): **21x**.
+- v4 GPU time per step (kits23 profile, 4.70 ms): histogram kernel 2.55 ms (54%),
+  softmax (forward + backward recompute) 1.47 ms (31%), backward kernel 0.56 ms
+  (12%). The contended scatters are gone entirely.
+
+**Hypothesis check**: v3 several x faster than v2 and dominated by the PyTorch
+backward: **confirmed** (3.7x; backward was ~60% of v3). v4 within a few x of the
+floor: **partly** (12-17% of peak; 6x above the floor). Peak memory ~ input size:
+**confirmed**.
+
+**Next levers** (measured): the histogram kernel runs at ~6% of peak bandwidth
+(2.55 ms vs 0.16 ms of traffic): it is compute-bound on the `[BLOCK, K]`
+compare-and-reduce. Softmax twice = 31%: fuse into both kernels (Sprint 8).
