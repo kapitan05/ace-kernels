@@ -1,5 +1,8 @@
 """Memory saved for backward: the instrumentation itself and the reference baseline."""
 
+import gc
+import weakref
+
 import pytest
 import torch
 
@@ -35,3 +38,27 @@ def test_reference_saves_per_voxel_tensors(binning: Binning) -> None:
     _, stats = measure_saved_tensors(lambda: ace_loss(x, y, config), exclude=[x])
     input_bytes = x.numel() * x.element_size()
     assert stats.extra_bytes > input_bytes, stats.extra_bytes
+
+
+def test_measurement_does_not_leak_saved_outputs() -> None:
+    """Regression: the pack hook must not keep saved outputs alive (ref cycle)."""
+    x = torch.randn(1000, requires_grad=True)
+    refs: list[weakref.ref[torch.Tensor]] = []
+
+    def f() -> torch.Tensor:
+        y = torch.softmax(x, 0)  # softmax saves its output for backward
+        refs.append(weakref.ref(y))
+        return y.sum()
+
+    out, _ = measure_saved_tensors(f)
+    del out
+    gc.collect()
+    assert refs[0]() is None
+
+
+def test_measured_graph_still_backpropagates() -> None:
+    x = torch.randn(1000, requires_grad=True)
+    out, _ = measure_saved_tensors(lambda: torch.softmax(x, 0)[0] * 3)
+    (grad,) = torch.autograd.grad(out, x)
+    (expected,) = torch.autograd.grad(torch.softmax(x, 0)[0] * 3, x)
+    torch.testing.assert_close(grad, expected)

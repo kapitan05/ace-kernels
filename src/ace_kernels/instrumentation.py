@@ -53,7 +53,11 @@ def measure_saved_tensors(
             stats.unique_bytes += nbytes
             if ptr in excluded:
                 stats.excluded_bytes += nbytes
-        return t
+        # Return a detached alias (same storage), not ``t`` itself: for tensors an
+        # op saves as its *output* (e.g. softmax), keeping ``t`` creates the cycle
+        # tensor -> grad_fn -> saved tensor -> tensor through C++ autograd nodes,
+        # which gc cannot collect. That leaked ~4x the input per call on a T4.
+        return t.detach()
 
     def unpack(t: torch.Tensor) -> torch.Tensor:
         return t
