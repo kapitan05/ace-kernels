@@ -116,7 +116,9 @@ def prepare(
             probs = probs[:, 1:]
         if labels.shape[-1] != probs[0, 0].numel():
             raise AssertionError("target and input spatial sizes differ")
-        return Prepared(probs.flatten(2).to(dtype), None, labels, input.dim() - 2)
+        return Prepared(
+            probs.flatten(2).to(dtype).contiguous(), None, labels, input.dim() - 2
+        )
 
     if use_labels:
         idx = target.long()
@@ -131,7 +133,10 @@ def prepare(
             f"({tuple(probs.shape)})"
         )
     return Prepared(
-        probs.flatten(2).to(dtype), onehot.flatten(2), None, input.dim() - 2
+        probs.flatten(2).to(dtype).contiguous(),
+        onehot.flatten(2),
+        None,
+        input.dim() - 2,
     )
 
 
