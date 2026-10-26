@@ -1,0 +1,19 @@
+# Accuracy re-check of Sprint 7's output-check flags against a float64 truth.
+name: verify-truth
+group: verify-accuracy
+hypothesis: >-
+  The Triton versions (v4, v5) are at least as accurate as the reference against a
+  float64 truth at every size. torch.compile's soft gradient on CUDA is less
+  accurate (the 0.5-1.4% deviation is error, not rounding). v2_recompute's
+  deviation at 256^3+ is fp32 summation error comparable to the reference's own.
+device: cuda
+impls: [reference, reference_compile, v1_clean_compile, v2_recompute, v4_triton, v5_triton]
+binnings: [soft, hard]
+modes: [fwd_bwd]
+warmup: 1
+reps: 2
+shapes:
+  - {name: kits23, batch: 2, channels: 4, spatial: [128, 128, 128]}
+  - {name: brats21, batch: 2, channels: 4, spatial: [224, 224, 144]}
+  - {name: amos22, batch: 2, channels: 16, spatial: [176, 176, 64]}
+  - {name: cube256, batch: 2, channels: 4, spatial: [256, 256, 256]}
