@@ -1,0 +1,21 @@
+# Sprints 5+6: Triton forward (v3) and Triton forward + backward (v4), hard binning.
+name: sprint56-paper
+group: sprint56-triton
+hypothesis: >-
+  The private-histogram forward removes the contended scatter (83-92% of time in
+  PyTorch versions): v3 is several times faster than v2_recompute and its time is
+  then dominated by the PyTorch backward. v4's one-pass Triton backward removes
+  that too: fwd+bwd within a few x of the bandwidth floor (>20% of peak), and
+  peak memory close to input + gradient size (no voxel-sized temporaries).
+device: cuda
+impls: [reference, v1_clean_compile, v2_recompute, v3_triton, v4_triton]
+binnings: [hard]
+modes: [fwd, fwd_bwd]
+cuda_graph: true
+warmup: 3
+reps: 10
+shapes:
+  - {name: kits23, batch: 2, channels: 4, spatial: [128, 128, 128]}
+  - {name: acdc17, batch: 2, channels: 4, spatial: [256, 256, 16]}
+  - {name: brats21, batch: 2, channels: 4, spatial: [224, 224, 144]}
+  - {name: amos22, batch: 2, channels: 16, spatial: [176, 176, 64]}

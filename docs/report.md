@@ -238,7 +238,7 @@ GPU time in scatter/gather kernels (kits23 profiles): v1_vectorized 92% / 65%
 
 ## Sprint 4: v2, handwritten backward (2026-10-26)
 
-**Done (GPU numbers pending `kaggle/run_sprint4.sh`)**
+**Done**
 - `docs/derivation.md`: forward, backward (`∂f/∂p_i = Σ_j s_kj/(K_ne W_kj)
   [w_ij + w'_ij (p_i - y_i - d_kj)]`), activation chain, edge cases, memory table.
 - `binning.py`: per-bin sums shared by v1_clean and v2 (refactor, v1_clean unchanged).
@@ -261,3 +261,38 @@ GPU time in scatter/gather kernels (kits23 profiles): v1_vectorized 92% / 65%
 | v1_clean | 3.00x | 11.75x |
 | v2_recompute | **0.0012x** (1.3 KB) | **0.0012x** |
 | v2_grad_in_fwd | 1.00x | 1.00x |
+
+### Sprint 4 GPU results: Tesla T4 (Kaggle), commit a2696e8, 2026-10-26
+
+Source: `results/kaggle/a2696e81824d-run-sprint4/` (W&B group `sprint4-v2`).
+Gate: 675 passed. Paper grid: 152 ok + 8 expected capture_failed, no leaks.
+Memory grid: 29 ok, 3 OOM (real, not leaks: left-allocated 0 everywhere).
+
+fwd+bwd, kits23 / brats21 (ms; saved-for-backward MiB; peak MiB of the isolated call):
+
+| impl | hard kits23 | soft kits23 | soft brats21 |
+|---|---|---|---|
+| reference | 100 ms; 192; 320 | 183; 704; 864 | 605; 2426; 3008 |
+| v1_clean | 38; 192; 496 | 116; 752; 1120 | 383; 2591; 3866 |
+| v1_clean_compile | **20**; 128; 256 | **55**; 356; 640 | **196**; 1227; 2206 |
+| v2_recompute | 47; **0**; 496 | 126; **0**; 992 | 416; **0**; 3424 |
+| v2_grad_in_fwd | 47; 64 (1x); 496 | 127; 64; 992 | 416; 221; 3424 |
+
+Memory headroom (2 x 4 x V^3, soft, fwd+bwd):
+
+| V | reference | v1_clean | v2_recompute |
+|---|---|---|---|
+| 256 | 1409 ms, peak 6.9 GiB | **OOM** | 954 ms, peak 7.9 GiB |
+| 288 | **OOM** | **OOM** | 1364 ms, peak 11.3 GiB |
+
+**Findings**
+1. Saved-for-backward drops to 0 (exact: 2 B C K floats) as designed, at every size.
+   v2 trains at 288^3 soft where the reference and v1 OOM: the paper's failure mode.
+2. Peak of the isolated loss call does not drop: it is set by voxel-sized forward
+   temporaries (int64 bin index, gathers) and backward recomputation, not by saved
+   tensors. In training the distinction matters (saved tensors coexist with all
+   network activations until backward; temporaries are freed at once), but a fully
+   lean loss needs kernels without temporaries (Triton).
+3. Time: v2 is 1.1-1.2x slower than v1_clean (recompute pass) and ~2x slower than
+   v1_clean_compile; the forward still uses the contended scatter.
+4. v2_grad_in_fwd has no advantage (same time, keeps 1x input): dropped from now on.

@@ -1,0 +1,21 @@
+# Sprints 5+6: % of peak bandwidth and peak memory vs volume, up to sizes where
+# the reference needs GiBs.
+name: sprint56-scaling
+group: sprint56-triton
+hypothesis: >-
+  v4_triton keeps a roughly constant, high fraction of peak bandwidth once the grid
+  fills the GPU (>= 64^3), and its peak memory grows like the input (not 3-6x it
+  like the PyTorch versions).
+device: cuda
+impls: [v1_clean_compile, v2_recompute, v3_triton, v4_triton]
+binnings: [hard]
+modes: [fwd, fwd_bwd]
+warmup: 3
+reps: 10
+shapes:
+  - {name: cube32, batch: 2, channels: 4, spatial: [32, 32, 32]}
+  - {name: cube64, batch: 2, channels: 4, spatial: [64, 64, 64]}
+  - {name: cube128, batch: 2, channels: 4, spatial: [128, 128, 128]}
+  - {name: cube192, batch: 2, channels: 4, spatial: [192, 192, 192]}
+  - {name: cube256, batch: 2, channels: 4, spatial: [256, 256, 256]}
+  - {name: cube288, batch: 2, channels: 4, spatial: [288, 288, 288]}
