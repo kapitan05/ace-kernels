@@ -144,7 +144,7 @@ how much is loop/sync overhead vs contention.
 
 ## Sprint 3: v1, vectorized PyTorch (2026-10-25)
 
-**Done (GPU numbers pending `kaggle/run_sprint3.sh`)**
+**Done**
 - `ace_kernels/common.py`: shared pre/post-processing reproducing the reference
   (activation, one-hot, background, empty classes, weights, reduction), the
   bit-identical bin boundaries, and `soft_assign` (reference soft weights).
@@ -181,3 +181,57 @@ how much is loop/sync overhead vs contention.
    indices. Moves to the Triton kernel (Sprint 5).
 4. The index-target path (no one-hot) saves writing a `[B, C, N]` float tensor
    but autograd keeps its gathered `[B, N]` int64 indices (+0.75x for soft at C=4).
+
+### Sprint 3 GPU results: Tesla T4 (Kaggle), commit 33facc7, 2026-10-25
+
+Source: `results/kaggle/33facc78d8f3-run-sprint3/` (W&B group `sprint3-v1`).
+Correctness gate on GPU: 452 passed. 208 benchmark rows, 0 OOM, 8 expected
+`capture_failed` (reference soft).
+
+fwd+bwd p50 ms, speedup vs reference (T4, 320 GB/s; all rows: ~same time as CUDA graph):
+
+| shape | binning | reference | compile | v1_vectorized | v1_clean | v1_clean_compile | best % peak BW |
+|---|---|---|---|---|---|---|---|
+| kits23 | hard | 99.4 | 66.1 (1.5x) | 84.3 (1.2x) | 37.4 (2.7x) | **20.1 (4.9x)** | 4.2 |
+| brats21 | hard | 352 | 238 (1.5x) | 308 (1.1x) | 137 (2.6x) | **74 (4.7x)** | 3.9 |
+| amos22 | hard | 805 | 501 (1.6x) | 599 (1.3x) | 218 (3.7x) | **112 (7.2x)** | 2.3 |
+| kits23 | soft | 182 | **38.9 (4.7x)** | 132 (1.4x) | 118 (1.5x) | 57 (3.2x) | 2.2 |
+| brats21 | soft | 610 | **139 (4.4x)** | 440 (1.4x) | 385 (1.6x) | 201 (3.0x) | 2.1 |
+| amos22 | soft | 1494 | 2704 (0.55x) | 729 (2.1x) | 550 (2.7x) | **335 (4.5x)** | 0.8 |
+
+GPU time in scatter/gather kernels (kits23 profiles): v1_vectorized 92% / 65%
+(hard / soft), v1_clean 83% / 61%, v1_clean_compile 86% / 89%.
+
+**Hypothesis check**
+- Loop removal gives a large speedup: **rejected**. Kernels drop 428 -> 78, time only
+  1.1-1.3x (2x for soft at 16 classes). Confirms Sprint 2: not launch-bound.
+- v1_clean adds a real gain: **confirmed**, 2.6-3.7x hard. Most of it is dropping
+  `scatter_reduce(mean)` for `scatter_add` (mean-reduce is far slower under
+  contention), plus no one-hot at 16 classes.
+- Becomes CUDA-graph capturable: **confirmed** (no host<->device copies; tested). But
+  graphs bring ~0 speedup anywhere: launch overhead is not the bottleneck.
+- Saved-for-backward unchanged: **confirmed** (192 MiB hard, 704-750 MiB soft at
+  kits23). Compile lowers it (128 / 356 MiB) by fusing intermediates.
+- Below the bandwidth floor: **confirmed**, best 4.2% of peak.
+
+**New findings**
+1. Scatter contention is still 83-92% of GPU time in every v1 variant: PyTorch ops
+   cannot avoid it. Per-block private histograms (Triton, Sprint 5) are the lever.
+2. Vectorizing raises **peak** memory (kits23 hard 320 -> 448-496 MiB, brats21 soft
+   3.0 -> 3.8 GiB): all B x C slices' temporaries exist at once. Compile brings it
+   back down (256 MiB / 2.2 GiB). Speed and peak memory trade off in PyTorch.
+3. reference_compile wins for soft at 4 classes (4.7x) but is 1.8x *slower* than
+   eager at 16 classes; v1_clean_compile is the only variant that is fast for both
+   class counts.
+
+**Harness issues found and fixed during the 5 Sprint 3 runs** (each a real bug):
+- GPU-vs-CPU gradient tolerance too tight for soft binning with ~3 voxels per bin
+  (cancelling terms amplify fp32 reordering ~1000x); hypothesis made deterministic.
+- Exact-tie subgradient (|x| at 0) differs between eager and compiled kernels; tie
+  cases check loss exactly and gradients for finiteness for compiled impls.
+- Wrong assumption corrected: the reference's boolean NaN fill does not sync; the
+  soft reference is not graph-capturable because of a host->device copy.
+- 38 rows OOM'd from ~10 GiB leaked across rows. Groups now run in isolated
+  processes, and each row records memory left allocated. That column located the leak
+  in `measure_saved_tensors`: the pack hook returned the tensor itself, creating
+  uncollectable tensor<->grad_fn cycles for saved outputs (fixed + regression test).
