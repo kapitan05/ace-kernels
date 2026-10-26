@@ -430,3 +430,21 @@ within ~1e-7 of an edge is binned differently in fp32 vs fp64. This is a propert
 of the loss (L1 of per-bin differences), not of an implementation. The output
 check now reports the relative L2 gradient error and flags on loss + L2 (`next`
 commit); max-norm errors stay as diagnostics.
+
+### L2 gradient verification (`results/kaggle/55b7d1a680c0-run-verify/`, T4)
+
+Relative L2 gradient error vs float64 truth (all 48 rows): **6e-5 .. 5.5e-4 for every
+implementation, the reference itself 6e-5 .. 4.3e-4**: all implementations compute the
+gradient equally accurately as a whole; the max-norm outliers are isolated voxels.
+
+Loss error vs float64 (worst over kits23, brats21, amos22, 256^3): v4_triton 3e-8 ..
+1e-6 and v5_triton 2e-8 .. 6e-7 vs reference up to 1.3e-5.
+
+Flagged (worse than 2x the reference's own error vs truth), all explained:
+- v1_clean_compile / v2_recompute, soft, brats21 and 256^3: loss 1.7e-5 / 7.5e-5 vs
+  reference 4.7e-6 / 1.3e-5. One scatter_add over all slices accumulates more fp32
+  rounding than the reference's per-slice sums. Intermediate steps only.
+- v5_triton, hard, brats21: L2 gradient 2.9e-4 vs reference 6.2e-5 (loss 30x *more*
+  accurate). In-kernel softmax uses Triton's fast exp (~1 ulp from torch), so more
+  near-edge voxels change bin than between fp32 PyTorch implementations. Candidate
+  fix: precise libdevice exp in `kernels/act.py` (cost to be measured).

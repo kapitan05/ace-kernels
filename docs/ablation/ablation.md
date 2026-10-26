@@ -60,20 +60,20 @@ Tesla T4 (Kaggle), fp32 logits, forward + backward, p50 over 10 calls, paper tra
 
 ## Accuracy vs float64 truth (latest verification run)
 
-| impl | binning | max loss err vs fp64 |
-|---|---|---|
-| reference | hard | 2.2e-06 |
-| reference_compile | hard | 2.2e-06 |
-| v1_clean_compile | hard | 2.2e-06 |
-| v2_recompute | hard | 2.2e-06 |
-| v4_triton | hard | 8.7e-07 |
-| v5_triton | hard | 9.7e-07 |
-| reference | soft | 1.3e-05 |
-| reference_compile | soft | 1.3e-05 |
-| v1_clean_compile | soft | 7.5e-05 |
-| v2_recompute | soft | 7.5e-05 |
-| v4_triton | soft | 8.1e-07 |
-| v5_triton | soft | 8.1e-07 |
+| impl | binning | max loss err vs fp64 | max L2 grad err vs fp64 |
+|---|---|---|---|
+| reference | hard | 2.3e-06 | 2.5e-04 |
+| reference_compile | hard | 2.4e-06 | 2.5e-04 |
+| v1_clean_compile | hard | 2.2e-06 | 2.5e-04 |
+| v2_recompute | hard | 2.2e-06 | 2.5e-04 |
+| v4_triton | hard | 9.7e-07 | 2.5e-04 |
+| v5_triton | hard | 5.6e-07 | 3.0e-04 |
+| reference | soft | 1.3e-05 | 4.3e-04 |
+| reference_compile | soft | 1.3e-05 | 5.1e-04 |
+| v1_clean_compile | soft | 7.5e-05 | 5.5e-04 |
+| v2_recompute | soft | 7.5e-05 | 4.3e-04 |
+| v4_triton | soft | 8.1e-07 | 4.3e-04 |
+| v5_triton | soft | 8.1e-07 | 4.3e-04 |
 
 ![ladder-hard](ladder-hard.png)
 ![ladder-soft](ladder-soft.png)
