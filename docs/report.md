@@ -353,3 +353,49 @@ floor: **partly** (12-17% of peak; 6x above the floor). Peak memory ~ input size
 **Next levers** (measured): the histogram kernel runs at ~6% of peak bandwidth
 (2.55 ms vs 0.16 ms of traffic): it is compute-bound on the `[BLOCK, K]`
 compare-and-reduce. Softmax twice = 31%: fuse into both kernels (Sprint 8).
+
+## Sprint 7: Triton soft binning (2026-10-26)
+
+**Done**
+- `kernels/soft_hist.py`: `soft_assign_tl` (reference half boundaries, sentinel
+  table, IEEE `div_rn` weights) + per-block private histograms through a
+  `[BLOCK, K]` weight matrix. `kernels/soft_bwd.py`: two-sided gradient
+  (`w' = -/+1/S`) + activation backward in registers. v3/v4 now cover soft.
+- Benchmark output check (`5423f09`): every row's loss and gradient compared with
+  the reference on the same full-size input (`loss_rel_err`, `grad_rel_err`,
+  WARNING above 1e-4), untimed, fallback v2_recompute when the reference OOMs.
+- GPU gate: 1269 passed (dev run: 578; soft kernels passed on their first GPU run).
+
+### Results: Tesla T4, commit 5423f09 (`results/kaggle/5423f093984d-run-sprint7/`)
+
+fwd+bwd, soft binning, p50 ms (speedup vs reference); peak MiB:
+
+| shape | reference | reference_compile | v1_clean_compile | v2_recompute | v3_triton | **v4_triton** |
+|---|---|---|---|---|---|---|
+| kits23 | 182; 864 | 39.8; 688 | 56.2; 640 | 120; 992 | 39.2; 896 | **7.4 (24.6x); 128** |
+| acdc17 | 92.9; 432 | 19.2 | 27.3 | 58.2 | 19.8 | **3.3 (28x); 64** |
+| brats21 | 607; 3008 | 136; 2388 | 199; 2206 | 393; 3424 | 135; 3092 | **26.4 (23x); 441** |
+| amos22 | 1492; 3360 | 2690 (0.55x) | 333 | 571 | 151 | **29.8 (50x); 484** |
+
+Memory sweep (2 x 4 x V^3 soft): reference OOM at 288^3; v4 at 288^3: 92.9 ms,
+**peak 1.46 GiB** (v2_recompute 11.3 GiB, reference 6.9 GiB already at 256^3).
+
+- v4 soft: 8.6-12.7% of peak bandwidth; 5.4x faster than the best PyTorch version
+  at 4 classes (reference_compile), 11x at 16 classes (v1_clean_compile).
+- Peak memory 6.8x below the reference (kits23 864 -> 128 MiB, brats21 3.0 GiB ->
+  441 MiB) and ~1x the input size; saved for backward: per-bin tensors only.
+- v4 soft GPU time (kits23, 6.49 ms): soft histogram kernel 4.14 ms (64%),
+  torch.softmax x2 1.47 ms (23%), backward kernel 0.76 ms (12%).
+- v3 soft is dominated by v2's PyTorch backward (elementwise kernels 60%).
+
+**Output check findings** (new; full-size inputs)
+1. Triton v3/v4: gradients within 0.8e-5..8.4e-5 of the reference, every row.
+2. `torch.compile` (reference_compile, v1_clean_compile), soft only: loss matches but
+   gradients deviate by 0.46-1.4% (relative to the max gradient) on every paper
+   shape. On CPU all versions are within 7e-6 of a float64 truth, so this is
+   specific to Inductor's CUDA code. The small golden tests ran compiled impls only
+   on 5 smoke cases, so this was invisible before.
+3. v2_recompute soft at 256^3 / 288^3: loss 6.2e-5 / 1.3e-4, grad 1.4e-4 / 2.5e-4
+   vs the reference (fp32 sums over ~16M voxels per bin; v4's tree sums deviate
+   less). Comparing two fp32 results cannot say which is closer to the exact
+   value: next step is a float64-truth comparison in the output check.
