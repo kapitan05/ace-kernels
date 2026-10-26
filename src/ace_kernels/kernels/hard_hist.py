@@ -18,6 +18,13 @@ import triton.language as tl
 from ace_kernels.binning import BinStats
 from ace_kernels.common import Prepared, hard_edges
 from ace_kernels.config import ACEConfig
+from ace_kernels.kernels.act import (
+    ACT_NONE,
+    act_code,
+    activate_tl,
+    channel_pow2,
+    softmax_stats,
+)
 
 _CONFIGS = [
     triton.Config({"BLOCK": block}, num_warps=warps)
@@ -29,16 +36,19 @@ _CONFIGS = [
 @triton.autotune(configs=_CONFIGS, key=["N", "C", "K"], reset_to_zero=["out_ptr"])
 @triton.jit
 def _hard_hist_kernel(
-    probs_ptr,  # [B, C, N] float32, contiguous
-    labels_ptr,  # [B, N] int64 class per voxel (-1: no channel); if USE_LABELS
-    onehot_ptr,  # [B, C, N] float32 targets; if not USE_LABELS
+    x_ptr,  # [B, C, N] probabilities (ACT none) or logits, any float dtype
+    labels_ptr,  # [B, N] int64 class per voxel, indexing x's channels; -1: none
+    onehot_ptr,  # [B, C, N] float targets aligned with x; if not USE_LABELS
     edges_ptr,  # [K] float32 upper bin edges (reference linspace)
-    out_ptr,  # [3, B, C, K] float32, zeroed: count, sum p, sum y
+    out_ptr,  # [3, B, C - OFFSET, K] float32, zeroed: count, sum p, sum y
     N,
-    C,
-    BCK,  # B * C * K: stride between the three statistics
+    C,  # channels of x
+    BCK,  # B * (C - OFFSET) * K: stride between the three statistics
     K: tl.constexpr,
     KP: tl.constexpr,  # next power of two >= K (tl.arange needs a power of 2)
+    CP: tl.constexpr,  # next power of two >= C (softmax tile)
+    OFFSET: tl.constexpr,  # 1: channel 0 (background) is not in the loss
+    ACT: tl.constexpr,  # activation applied in-kernel (act.py)
     RIGHT: tl.constexpr,
     USE_LABELS: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -52,9 +62,14 @@ def _hard_hist_kernel(
     bin_ok = bins < K
     if USE_LABELS:
         label = tl.load(labels_ptr + b * N + offs, mask=valid, other=-1)
-    for c in range(C):
+    m = tl.zeros([BLOCK], dtype=tl.float32)
+    s = tl.full([BLOCK], 1.0, dtype=tl.float32)
+    if ACT == 1:
+        m, s = softmax_stats(x_ptr, b, offs, valid, N, C, CP)
+    for c in range(OFFSET, C):
         base = (b * C + c) * N
-        p = tl.load(probs_ptr + base + offs, mask=valid, other=0.0)
+        x = tl.load(x_ptr + base + offs, mask=valid, other=0.0).to(tl.float32)
+        p = tl.where(valid, activate_tl(x, m, s, ACT), 0.0)
         idx = tl.zeros([BLOCK], dtype=tl.int32)
         for k in tl.static_range(K):
             edge = tl.load(edges_ptr + k)
@@ -65,12 +80,12 @@ def _hard_hist_kernel(
         if USE_LABELS:
             y = ((label == c) & valid).to(tl.float32)
         else:
-            y = tl.load(onehot_ptr + base + offs, mask=valid, other=0.0)
+            y = tl.load(onehot_ptr + base + offs, mask=valid, other=0.0).to(tl.float32)
         hit = ((idx[:, None] == bins[None, :]) & valid[:, None]).to(tl.float32)
         count = tl.sum(hit, axis=0)
         sum_p = tl.sum(hit * p[:, None], axis=0)
         sum_y = tl.sum(hit * y[:, None], axis=0)
-        out = out_ptr + (b * C + c) * K + bins
+        out = out_ptr + (b * (C - OFFSET) + c - OFFSET) * K + bins
         tl.atomic_add(out, count, mask=bin_ok)
         tl.atomic_add(out + BCK, sum_p, mask=bin_ok)
         tl.atomic_add(out + 2 * BCK, sum_y, mask=bin_ok)
@@ -103,6 +118,48 @@ def hard_stats_triton(prep: Prepared, config: ACEConfig) -> BinStats:
         b * c * k,
         K=k,
         KP=max(2, triton.next_power_of_2(k)),  # arange of size 1 is degenerate
+        CP=2,
+        OFFSET=0,
+        ACT=ACT_NONE,
+        RIGHT=config.right,
+        USE_LABELS=use_labels,
+    )
+    count, sum_p, sum_y = out.unbind(0)
+    return BinStats(count, sum_p, sum_y, count == 0)
+
+
+def hard_stats_fused(
+    x: torch.Tensor, target: torch.Tensor, config: ACEConfig
+) -> BinStats:
+    """Hard statistics straight from logits ``x`` [B, C, N] (activation in-kernel).
+
+    ``target``: ``[B, N]`` class indices (original numbering) when ``to_onehot_y``
+    and C > 1, else ``[B, C, N]`` targets. Covers the loss channels (C - 1 when the
+    background is dropped).
+    """
+    b, c, n = x.shape
+    k = config.num_bins
+    offset = 1 if (not config.include_background and c > 1) else 0
+    out = torch.zeros((3, b, c - offset, k), device=x.device, dtype=torch.float32)
+    use_labels = target.dim() == 2
+
+    def grid(meta: dict[str, int]) -> tuple[int, int]:
+        return (triton.cdiv(n, meta["BLOCK"]), b)
+
+    _hard_hist_kernel[grid](
+        x,
+        target if use_labels else x,
+        x if use_labels else target,
+        hard_edges(k, x.device).contiguous(),
+        out,
+        n,
+        c,
+        b * (c - offset) * k,
+        K=k,
+        KP=max(2, triton.next_power_of_2(k)),
+        CP=channel_pow2(c),
+        OFFSET=offset,
+        ACT=act_code(config, c),
         RIGHT=config.right,
         USE_LABELS=use_labels,
     )

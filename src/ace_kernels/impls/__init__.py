@@ -7,6 +7,7 @@ from ace_kernels.impls import (
     v1_vectorized,
     v2_autograd,
     v3_triton,
+    v5_triton,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "v1_vectorized",
     "v2_autograd",
     "v3_triton",
+    "v5_triton",
 ]

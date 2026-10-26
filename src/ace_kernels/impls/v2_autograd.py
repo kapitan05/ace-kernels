@@ -60,8 +60,13 @@ def _stats(prep: Prepared, config: ACEConfig, backend: StatsBackend) -> BinStats
 def _bin_coefficients(
     prep: Prepared, config: ACEConfig, backend: StatsBackend = "torch"
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return coefficients(_stats(prep, config, backend))
+
+
+def coefficients(
+    stats: BinStats,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Per-class error ``f`` [B, C], class presence, and the per-bin ``coef``, ``d``."""
-    stats = _stats(prep, config, backend)
     d = bin_difference(stats)
     f = torch.nanmean(per_bin_error(stats), dim=-1)
     nonempty = ~stats.empty

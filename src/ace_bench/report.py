@@ -273,6 +273,7 @@ def write_summary(df: pl.DataFrame, meta: dict[str, Any], out: Path) -> str:
         f"Hypothesis: {config['hypothesis']}",
         "",
         f"Device: {env['device_name']} | peak BW {env['peak_bandwidth_gbps']} GB/s | "
+        f"logits {config.get('dtype', 'float32')} | "
         f"torch {env['torch_version']} | triton {env['triton_version']} | "
         f"git {env['git_sha']}{' (dirty)' if env['git_dirty'] else ''}",
         "",

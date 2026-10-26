@@ -31,6 +31,7 @@ class Row(BaseModel):
     binning: str
     mode: str
     cuda_graph: bool
+    dtype: str = "float32"
     shape: str
     batch: int
     channels: int
@@ -106,15 +107,20 @@ def _loss_and_grad(
     leaf = x.detach().requires_grad_(True)
     loss = ace_loss(leaf, y, config, impl=impl)
     (grad,) = torch.autograd.grad(loss.sum(), leaf)
-    return loss.detach().cpu(), grad.cpu()
+    return loss.detach().float().cpu(), grad.float().cpu()
 
 
 def compute_reference(
-    shape: ShapeSpec, loss_config: ACEConfig, device: str, seed: int = 0
+    shape: ShapeSpec,
+    loss_config: ACEConfig,
+    device: str,
+    seed: int = 0,
+    dtype: str = "float32",
 ) -> Reference | None:
     """The reference's result on the benchmark input (fallback: v2_recompute)."""
     spec = InputSpec(shape.batch, shape.channels, shape.spatial, seed=seed)
     x, y = make_inputs(spec, loss_config, device)
+    x = x.to(getattr(torch, dtype))
     for impl in ("reference", FALLBACK_REFERENCE):
         try:
             with warnings.catch_warnings():
@@ -130,6 +136,7 @@ def _relative_errors(
     impl: str, x: torch.Tensor, y: torch.Tensor, config: ACEConfig, ref: Reference
 ) -> tuple[float, float]:
     loss, grad = _loss_and_grad(impl, x, y, config)
+    grad = grad.float()
     loss_err = (loss - ref.loss).abs().max() / ref.loss.abs().max().clamp_min(1e-12)
     grad_err = (grad - ref.grad).abs().max() / ref.grad.abs().max().clamp_min(1e-12)
     return float(loss_err), float(grad_err)
@@ -207,10 +214,12 @@ def measure_case(
     reps: int = 10,
     seed: int = 0,
     reference: Reference | None = None,
+    dtype: str = "float32",
 ) -> Row:
     device = env.device
     spec = InputSpec(shape.batch, shape.channels, shape.spatial, seed=seed)
     x, y = make_inputs(spec, loss_config, device)
+    x = x.to(getattr(torch, dtype))
     x.requires_grad_(True)  # as in training: fwd also pays for saving tensors
     input_bytes = x.numel() * x.element_size()
     target_bytes = y.numel() * y.element_size()
@@ -220,6 +229,7 @@ def measure_case(
         binning=loss_config.binning,
         mode=mode,
         cuda_graph=cuda_graph,
+        dtype=dtype,
         shape=shape.name,
         batch=shape.batch,
         channels=shape.channels,

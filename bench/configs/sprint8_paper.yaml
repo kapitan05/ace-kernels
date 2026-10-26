@@ -1,0 +1,19 @@
+# Sprint 8a: fused activation (v5) vs separate torch.softmax (v4), float32 logits.
+name: sprint8-paper
+group: sprint8-fused
+hypothesis: >-
+  Fusing softmax into both kernels removes the two torch.softmax passes (31% of
+  v4's GPU time): v5 is ~1.4x faster than v4 for hard and soft, reaches >20% of
+  peak bandwidth, and needs no probability tensor (peak memory ~ gradient only).
+device: cuda
+impls: [reference, reference_compile, v1_clean_compile, v4_triton, v5_triton]
+binnings: [hard, soft]
+modes: [fwd, fwd_bwd]
+cuda_graph: true
+warmup: 3
+reps: 10
+shapes:
+  - {name: kits23, batch: 2, channels: 4, spatial: [128, 128, 128]}
+  - {name: acdc17, batch: 2, channels: 4, spatial: [256, 256, 16]}
+  - {name: brats21, batch: 2, channels: 4, spatial: [224, 224, 144]}
+  - {name: amos22, batch: 2, channels: 16, spatial: [176, 176, 64]}

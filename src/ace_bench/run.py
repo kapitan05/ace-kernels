@@ -68,7 +68,9 @@ def run_group(job: Job) -> list[Row]:
     loss_config = config.loss.model_copy(update={"binning": job.binning})
     graph_options = [False, True] if config.cuda_graph else [False]
     reference = (
-        compute_reference(job.shape, loss_config, config.device, config.seed)
+        compute_reference(
+            job.shape, loss_config, config.device, config.seed, config.dtype
+        )
         if config.verify
         else None
     )
@@ -87,6 +89,7 @@ def run_group(job: Job) -> list[Row]:
             reps=config.reps,
             seed=config.seed,
             reference=reference,
+            dtype=config.dtype,
         )
         release_memory(config.device)
         if config.device == "cuda":

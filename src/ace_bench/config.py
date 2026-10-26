@@ -45,6 +45,8 @@ class BenchConfig(BaseModel):
     isolate: bool = True
     # compare every row's loss and gradient with the reference on the same input
     verify: bool = True
+    # storage dtype of the logits fed to the loss (the reference computes in fp32)
+    dtype: Literal["float32", "bfloat16", "float16"] = "float32"
     warmup: int = Field(default=3, ge=0)
     reps: int = Field(default=10, ge=1)
     seed: int = 0

@@ -7,6 +7,7 @@ from ace_kernels import ACEConfig
 from ace_kernels.binning import BinStats, bin_stats, hard_stats, soft_stats
 from ace_kernels.cases import InputKind, InputSpec, make_inputs
 from ace_kernels.common import Prepared, prepare
+from ace_kernels.config import Binning
 from ace_kernels.kernels import HAS_TRITON
 
 pytestmark = [
@@ -242,3 +243,71 @@ def test_large_volume_grid_soft() -> None:
     leaf = x.clone().requires_grad_(True)
     (grad,) = torch.autograd.grad(ace_loss(leaf, y, config, impl="v4_triton"), leaf)
     assert torch.isfinite(grad).all()
+
+
+@pytest.mark.parametrize("binning", ["hard", "soft"])
+@pytest.mark.parametrize("name", sorted(BWD_CONFIGS))
+@pytest.mark.parametrize("spatial", [(7,), (33, 17, 5), (64, 64, 64)])
+def test_v5_matches_v4(binning: str, name: str, spatial: tuple[int, ...]) -> None:
+    """Fused activation == separate torch activation (loss and gradient)."""
+    from ace_kernels import ace_loss
+
+    config = ACEConfig.model_validate({"binning": binning, **BWD_CONFIGS[name]})
+    spec = InputSpec(2, 5, spatial, seed=11, labels_as_index=config.to_onehot_y)
+    x, y = make_inputs(spec, config, "cuda")
+    out = []
+    for impl in ("v4_triton", "v5_triton"):
+        leaf = x.clone().requires_grad_(True)
+        loss = ace_loss(leaf, y, config, impl=impl)
+        upstream = torch.linspace(0.5, 2.0, loss.numel(), device="cuda").view_as(loss)
+        out.append((loss.detach(), torch.autograd.grad(loss, leaf, upstream)[0]))
+    torch.testing.assert_close(out[1][0], out[0][0], rtol=1e-5, atol=1e-7)
+    torch.testing.assert_close(out[1][1], out[0][1], rtol=1e-4, atol=1e-8)
+
+
+HALF = [
+    torch.float16,
+    pytest.param(
+        torch.bfloat16,
+        marks=pytest.mark.skipif(
+            not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()),
+            reason="GPU without native bfloat16 (e.g. T4, sm_75)",
+        ),
+    ),
+]
+
+
+@pytest.mark.parametrize("dtype", HALF)
+@pytest.mark.parametrize("binning", ["hard", "soft"])
+def test_v5_half_precision_logits(dtype: torch.dtype, binning: Binning) -> None:
+    """Half logits are read natively; all math is fp32 after the load."""
+    from ace_kernels import ace_loss
+
+    config = ACEConfig(binning=binning, to_onehot_y=True)
+    x, y = make_inputs(InputSpec(2, 4, (48, 48, 32), seed=4), config, "cuda")
+    x_half = x.to(dtype)
+    results = []
+    for inp in (x_half, x_half.float()):  # same values, half vs fp32 storage
+        leaf = inp.clone().requires_grad_(True)
+        loss = ace_loss(leaf, y, config, impl="v5_triton")
+        (grad,) = torch.autograd.grad(loss, leaf)
+        assert grad.dtype == inp.dtype
+        results.append((loss.detach(), grad.float()))
+    torch.testing.assert_close(results[0][0], results[1][0], rtol=1e-5, atol=1e-7)
+    torch.testing.assert_close(results[0][1], results[1][1], rtol=2e-2, atol=1e-6)
+
+
+@pytest.mark.parametrize("binning", ["hard", "soft"])
+def test_v5_saves_only_per_bin_tensors(binning: Binning) -> None:
+    from ace_kernels import ace_loss
+    from ace_kernels.instrumentation import measure_saved_tensors
+
+    config = ACEConfig(binning=binning, to_onehot_y=True)
+    b, c, k = 2, 4, config.num_bins
+    x, y = make_inputs(InputSpec(b, c, (32, 32, 32)), config, "cuda")
+    x.requires_grad_(True)
+    _, stats = measure_saved_tensors(
+        lambda: ace_loss(x, y, config, impl="v5_triton"), exclude=[x, y]
+    )
+    # coef and d (float32 [B, C, K]) + reduction jacobian (float32 [B, C])
+    assert stats.extra_bytes == 2 * b * c * k * 4 + b * c * 4

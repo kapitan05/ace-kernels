@@ -17,6 +17,7 @@ import triton.language as tl
 
 from ace_kernels.common import hard_edges
 from ace_kernels.config import ACEConfig
+from ace_kernels.kernels.act import activate_tl, softmax_stats
 
 ACT_NONE, ACT_SOFTMAX, ACT_SIGMOID = 0, 1, 2
 
@@ -30,7 +31,7 @@ _CONFIGS = [
 @triton.autotune(configs=_CONFIGS, key=["N", "C", "K"])
 @triton.jit
 def _hard_bwd_kernel(
-    probs_ptr,  # [B, C, N] float32 probabilities over ALL channels, contiguous
+    x_ptr,  # [B, C, N] probabilities, or logits if FROM_LOGITS (any float dtype)
     coef_ptr,  # [B, C - OFFSET, K] float32: sign(d) / (K_ne W), 0 for empty bins
     g_ptr,  # [B, C - OFFSET] float32: dL/df_bc
     edges_ptr,  # [K] float32
@@ -42,6 +43,7 @@ def _hard_bwd_kernel(
     CP: tl.constexpr,  # next power of two >= C
     RIGHT: tl.constexpr,
     ACT: tl.constexpr,
+    FROM_LOGITS: tl.constexpr,  # recompute the activation in-kernel (fused)
     BLOCK: tl.constexpr,
 ):
     # voxel blocks on grid axis 0 (up to 2^31 - 1 programs); axis 1 is limited to
@@ -53,7 +55,12 @@ def _hard_bwd_kernel(
     chan_ok = chan < C
     mask = chan_ok[:, None] & valid[None, :]
     ptrs = b * C * N + chan[:, None] * N + offs[None, :]
-    p = tl.load(probs_ptr + ptrs, mask=mask, other=0.0)  # [CP, BLOCK]
+    if FROM_LOGITS:  # same functions as the forward kernels -> same bins
+        m, s = softmax_stats(x_ptr, b, offs, valid, N, C, CP)
+        x = tl.load(x_ptr + ptrs, mask=mask, other=0.0).to(tl.float32)
+        p = tl.where(mask, activate_tl(x, m[None, :], s[None, :], ACT), 0.0)
+    else:
+        p = tl.load(x_ptr + ptrs, mask=mask, other=0.0).to(tl.float32)  # [CP, BLOCK]
 
     idx = tl.zeros([CP, BLOCK], dtype=tl.int32)
     for k in tl.static_range(K):
@@ -80,7 +87,7 @@ def _hard_bwd_kernel(
         dx = gp * p * (1.0 - p)
     else:
         dx = gp
-    tl.store(dx_ptr + ptrs, dx, mask=mask)
+    tl.store(dx_ptr + ptrs, dx.to(dx_ptr.dtype.element_ty), mask=mask)
 
 
 def hard_input_grad_triton(
@@ -88,14 +95,18 @@ def hard_input_grad_triton(
     coef: torch.Tensor,
     g: torch.Tensor,
     config: ACEConfig,
+    from_logits: bool = False,
 ) -> torch.Tensor:
     """``dL/d(input)`` [B, C, N] from all-channel ``probs`` and the forward's ``coef``.
+
+    With ``from_logits``, ``probs`` holds the logits (fp32/bf16/fp16) and the
+    activation is recomputed in-kernel; the gradient has the logits' dtype.
 
     ``coef`` and ``g`` cover the loss channels (C - 1 when the background is
     dropped). Softmax with one channel is the identity, as in the reference.
     """
     probs = probs.contiguous()
-    if probs.dtype != torch.float32 or not probs.is_cuda:
+    if not probs.is_cuda or (probs.dtype != torch.float32 and not from_logits):
         raise ValueError("hard_input_grad_triton needs float32 CUDA probabilities")
     b, c, n = probs.shape
     k = config.num_bins
@@ -124,5 +135,6 @@ def hard_input_grad_triton(
         CP=max(2, triton.next_power_of_2(c)),
         RIGHT=config.right,
         ACT=act,
+        FROM_LOGITS=from_logits,
     )
     return dx

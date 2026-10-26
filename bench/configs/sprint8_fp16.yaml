@@ -1,0 +1,18 @@
+# Sprint 8a: half-precision logits (fp16: the T4 has no native bf16).
+name: sprint8-fp16
+group: sprint8-fused
+hypothesis: >-
+  v5 reads fp16 logits natively (math in fp32): the logits' traffic halves, so v5
+  fp16 is faster than v5 fp32 and its gradient matches the fp32 reference to fp16
+  precision (output check < 1e-2). The reference and v4 cast to fp32 internally.
+device: cuda
+dtype: float16
+impls: [reference, v4_triton, v5_triton]
+binnings: [hard, soft]
+modes: [fwd_bwd]
+warmup: 3
+reps: 10
+shapes:
+  - {name: kits23, batch: 2, channels: 4, spatial: [128, 128, 128]}
+  - {name: brats21, batch: 2, channels: 4, spatial: [224, 224, 144]}
+  - {name: amos22, batch: 2, channels: 16, spatial: [176, 176, 64]}

@@ -15,6 +15,7 @@ import triton
 import triton.language as tl
 
 from ace_kernels.config import ACEConfig
+from ace_kernels.kernels.act import activate_tl, softmax_stats
 from ace_kernels.kernels.hard_bwd import ACT_NONE, ACT_SIGMOID, ACT_SOFTMAX
 from ace_kernels.kernels.soft_hist import soft_assign_tl, soft_tables
 
@@ -28,7 +29,7 @@ _CONFIGS = [
 @triton.autotune(configs=_CONFIGS, key=["N", "C", "K"])
 @triton.jit
 def _soft_bwd_kernel(
-    probs_ptr,  # [B, C, N] float32 probabilities over ALL channels
+    x_ptr,  # [B, C, N] probabilities, or logits if FROM_LOGITS (any float dtype)
     labels_ptr,  # [B, N] int64 original class index (unshifted); if USE_LABELS
     onehot_ptr,  # [B, C, N] float32 targets over ALL channels; if not USE_LABELS
     coef_ptr,  # [B, C - OFFSET, K] float32
@@ -44,6 +45,7 @@ def _soft_bwd_kernel(
     CP: tl.constexpr,
     RIGHT: tl.constexpr,
     ACT: tl.constexpr,
+    FROM_LOGITS: tl.constexpr,  # recompute the activation in-kernel (fused)
     USE_LABELS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -54,12 +56,17 @@ def _soft_bwd_kernel(
     chan_ok = chan < C
     mask = chan_ok[:, None] & valid[None, :]
     ptrs = b * C * N + chan[:, None] * N + offs[None, :]
-    p = tl.load(probs_ptr + ptrs, mask=mask, other=0.0)  # [CP, BLOCK]
+    if FROM_LOGITS:  # same functions as the forward kernels -> same bins
+        m, s = softmax_stats(x_ptr, b, offs, valid, N, C, CP)
+        x = tl.load(x_ptr + ptrs, mask=mask, other=0.0).to(tl.float32)
+        p = tl.where(mask, activate_tl(x, m[None, :], s[None, :], ACT), 0.0)
+    else:
+        p = tl.load(x_ptr + ptrs, mask=mask, other=0.0).to(tl.float32)  # [CP, BLOCK]
     if USE_LABELS:
         label = tl.load(labels_ptr + b * N + offs, mask=valid, other=-1)
         y = (label[None, :] == chan[:, None]).to(tl.float32)
     else:
-        y = tl.load(onehot_ptr + ptrs, mask=mask, other=0.0)
+        y = tl.load(onehot_ptr + ptrs, mask=mask, other=0.0).to(tl.float32)
 
     left, right, lw, rw, span = soft_assign_tl(p, half_ptr, repl_ptr, K, RIGHT)
     inv_span = tl.div_rn(1.0, span)
@@ -87,7 +94,7 @@ def _soft_bwd_kernel(
         dx = gp * p * (1.0 - p)
     else:
         dx = gp
-    tl.store(dx_ptr + ptrs, dx, mask=mask)
+    tl.store(dx_ptr + ptrs, dx.to(dx_ptr.dtype.element_ty), mask=mask)
 
 
 def soft_input_grad_triton(
@@ -97,15 +104,17 @@ def soft_input_grad_triton(
     d: torch.Tensor,
     g: torch.Tensor,
     config: ACEConfig,
+    from_logits: bool = False,
 ) -> torch.Tensor:
     """``dL/d(input)`` [B, C, N] for soft binning.
 
     ``target``: ``[B, 1, ...]`` class indices when ``config.to_onehot_y`` (and C > 1),
     else targets with the input's channels. ``coef``, ``d``, ``g`` cover the loss
-    channels (C - 1 when the background is dropped).
+    channels (C - 1 when the background is dropped). With ``from_logits``,
+    ``probs`` holds the logits and the activation is recomputed in-kernel.
     """
     probs = probs.contiguous()
-    if probs.dtype != torch.float32 or not probs.is_cuda:
+    if not probs.is_cuda or (probs.dtype != torch.float32 and not from_logits):
         raise ValueError("soft_input_grad_triton needs float32 CUDA probabilities")
     b, c, n = probs.shape
     k = config.num_bins
@@ -142,6 +151,7 @@ def soft_input_grad_triton(
         CP=max(2, triton.next_power_of_2(c)),
         RIGHT=config.right,
         ACT=act,
+        FROM_LOGITS=from_logits,
         USE_LABELS=use_labels,
     )
     return dx

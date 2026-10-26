@@ -22,6 +22,13 @@ import triton.language as tl
 from ace_kernels.binning import BinStats
 from ace_kernels.common import Prepared, soft_half_boundaries
 from ace_kernels.config import ACEConfig
+from ace_kernels.kernels.act import (
+    ACT_NONE,
+    act_code,
+    activate_tl,
+    channel_pow2,
+    softmax_stats,
+)
 
 _CONFIGS = [
     triton.Config({"BLOCK": block}, num_warps=warps)
@@ -53,17 +60,20 @@ def soft_assign_tl(p, half_ptr, repl_ptr, K: tl.constexpr, RIGHT: tl.constexpr):
 @triton.autotune(configs=_CONFIGS, key=["N", "C", "K"], reset_to_zero=["out_ptr"])
 @triton.jit
 def _soft_hist_kernel(
-    probs_ptr,  # [B, C, N] float32, contiguous
-    labels_ptr,  # [B, N] int64 class per voxel (-1: no channel); if USE_LABELS
-    onehot_ptr,  # [B, C, N] float32 targets; if not USE_LABELS
+    x_ptr,  # [B, C, N] probabilities (ACT none) or logits, any float dtype
+    labels_ptr,  # [B, N] int64 class per voxel, indexing x's channels; -1: none
+    onehot_ptr,  # [B, C, N] float targets aligned with x; if not USE_LABELS
     half_ptr,  # [2K + 1] float32 half boundaries (reference linspace)
     repl_ptr,  # [2K + 2] float32: -10000, c0, c0, c1, c1, ..., 10000
-    out_ptr,  # [3, B, C, K] float32, zeroed: weight sum, sum w p, sum w y
+    out_ptr,  # [3, B, C - OFFSET, K] float32, zeroed: weight sum, sum wp, sum wy
     N,
     C,
-    BCK,
+    BCK,  # B * (C - OFFSET) * K
     K: tl.constexpr,
     KP: tl.constexpr,
+    CP: tl.constexpr,
+    OFFSET: tl.constexpr,
+    ACT: tl.constexpr,
     RIGHT: tl.constexpr,
     USE_LABELS: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -75,20 +85,25 @@ def _soft_hist_kernel(
     bin_ok = bins < K
     if USE_LABELS:
         label = tl.load(labels_ptr + b * N + offs, mask=valid, other=-1)
-    for c in range(C):
+    m = tl.zeros([BLOCK], dtype=tl.float32)
+    s = tl.full([BLOCK], 1.0, dtype=tl.float32)
+    if ACT == 1:
+        m, s = softmax_stats(x_ptr, b, offs, valid, N, C, CP)
+    for c in range(OFFSET, C):
         base = (b * C + c) * N
-        p = tl.load(probs_ptr + base + offs, mask=valid, other=0.0)
+        x = tl.load(x_ptr + base + offs, mask=valid, other=0.0).to(tl.float32)
+        p = tl.where(valid, activate_tl(x, m, s, ACT), 0.0)
         left, right, lw, rw, _ = soft_assign_tl(p, half_ptr, repl_ptr, K, RIGHT)
         lw = tl.where(valid, lw, 0.0)
         rw = tl.where(valid, rw, 0.0)
         if USE_LABELS:
             y = ((label == c) & valid).to(tl.float32)
         else:
-            y = tl.load(onehot_ptr + base + offs, mask=valid, other=0.0)
+            y = tl.load(onehot_ptr + base + offs, mask=valid, other=0.0).to(tl.float32)
         w = (left[:, None] == bins[None, :]).to(tl.float32) * lw[:, None] + (
             right[:, None] == bins[None, :]
         ).to(tl.float32) * rw[:, None]
-        out = out_ptr + (b * C + c) * K + bins
+        out = out_ptr + (b * (C - OFFSET) + c - OFFSET) * K + bins
         tl.atomic_add(out, tl.sum(w, axis=0), mask=bin_ok)
         tl.atomic_add(out + BCK, tl.sum(w * p[:, None], axis=0), mask=bin_ok)
         tl.atomic_add(out + 2 * BCK, tl.sum(w * y[:, None], axis=0), mask=bin_ok)
@@ -132,6 +147,45 @@ def soft_stats_triton(prep: Prepared, config: ACEConfig) -> BinStats:
         b * c * k,
         K=k,
         KP=max(2, triton.next_power_of_2(k)),
+        CP=2,
+        OFFSET=0,
+        ACT=ACT_NONE,
+        RIGHT=config.right,
+        USE_LABELS=use_labels,
+    )
+    weight, sum_p, sum_y = out.unbind(0)
+    return BinStats(weight, sum_p, sum_y, weight < config.empty_weight)
+
+
+def soft_stats_fused(
+    x: torch.Tensor, target: torch.Tensor, config: ACEConfig
+) -> BinStats:
+    """Soft statistics straight from logits ``x`` [B, C, N]; see hard_stats_fused."""
+    b, c, n = x.shape
+    k = config.num_bins
+    offset = 1 if (not config.include_background and c > 1) else 0
+    out = torch.zeros((3, b, c - offset, k), device=x.device, dtype=torch.float32)
+    use_labels = target.dim() == 2
+    half, repl = soft_tables(k, x.device)
+
+    def grid(meta: dict[str, int]) -> tuple[int, int]:
+        return (triton.cdiv(n, meta["BLOCK"]), b)
+
+    _soft_hist_kernel[grid](
+        x,
+        target if use_labels else x,
+        x if use_labels else target,
+        half,
+        repl,
+        out,
+        n,
+        c,
+        b * (c - offset) * k,
+        K=k,
+        KP=max(2, triton.next_power_of_2(k)),
+        CP=channel_pow2(c),
+        OFFSET=offset,
+        ACT=act_code(config, c),
         RIGHT=config.right,
         USE_LABELS=use_labels,
     )

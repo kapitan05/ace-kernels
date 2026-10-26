@@ -20,7 +20,7 @@ pytestmark = [
 
 
 GRAPH_SAFE = ["v1_clean", "v2_recompute", "v2_grad_in_fwd"] + (
-    ["v3_triton", "v4_triton"] if HAS_TRITON else []
+    ["v3_triton", "v4_triton", "v5_triton"] if HAS_TRITON else []
 )
 
 
