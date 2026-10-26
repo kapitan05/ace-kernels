@@ -1,9 +1,13 @@
-"""v3_triton: v2_recompute with the forward's per-bin sums from a Triton kernel.
+"""Triton implementations (hard binning, float32, CUDA; registered with Triton).
 
-The forward's contended ``scatter_add`` (83-92% of GPU time in v1/v2, Sprint 3)
-is replaced by per-block private histograms (``kernels/hard_hist.py``). The
-backward is still v2's handwritten PyTorch backward (Triton backward: Sprint 6).
-Hard binning, float32, CUDA only; registered only where Triton is installed.
+- ``v3_triton`` (Sprint 5): v2_recompute with the forward's per-bin sums from
+  per-block private histograms (``kernels/hard_hist.py``) instead of the contended
+  ``scatter_add`` (83-92% of GPU time in v1/v2). Backward: v2's PyTorch backward.
+- ``v4_triton`` (Sprint 6): + the backward as one Triton pass
+  (``kernels/hard_bwd.py``): gather ``coef`` per voxel and the softmax backward in
+  registers. Saves only ``coef`` and a ``[B, C]`` reduction jacobian.
+
+float64 inputs (gradcheck) fall back to the PyTorch paths.
 """
 
 import torch
@@ -27,3 +31,16 @@ if HAS_TRITON:
         if input.dtype == torch.float64:  # gradcheck path: kernel is float32-only
             return _apply(input, target, config, "recompute", "torch")
         return _apply(input, target, config, "recompute", "triton")
+
+    @register(
+        "v4_triton",
+        description="Triton private-histogram forward + Triton backward",
+        binnings=frozenset({"hard"}),
+        devices=frozenset({"cuda"}),
+    )
+    def v4_triton(
+        input: torch.Tensor, target: torch.Tensor, config: ACEConfig
+    ) -> torch.Tensor:
+        if input.dtype == torch.float64:
+            return _apply(input, target, config, "recompute", "torch")
+        return _apply(input, target, config, "triton_bwd", "triton")

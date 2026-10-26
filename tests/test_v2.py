@@ -131,3 +131,23 @@ def test_grad_in_fwd_scales_with_upstream_gradient() -> None:
         loss = 3.5 * ace_loss(leaf, y, config, impl=impl)
         grads.append(torch.autograd.grad(loss, leaf)[0])
     torch.testing.assert_close(grads[0], grads[1], rtol=1e-10, atol=1e-14)
+
+
+@pytest.mark.parametrize("name", sorted(CONFIGS))
+def test_reduction_jacobian_matches_autograd_upstream(name: str) -> None:
+    """Triton backward's shortcut dL/df = grad_output * jac == v2's autograd path."""
+    from ace_kernels.common import prepare
+    from ace_kernels.impls.v2_autograd import _reduction_jacobian, _upstream
+
+    config, x, y = _inputs(name, "hard")
+    prep = prepare(x, y, config, keep_labels=True)
+    b, c = prep.probs.shape[:2]
+    f = torch.rand(b, c, dtype=x.dtype)
+    if config.reduction == "none":
+        grad_output = torch.randn(b, c, *([1] * prep.spatial_ndim), dtype=x.dtype)
+        shortcut = _reduction_jacobian(f, prep, config) * grad_output.view(b, c)
+    else:
+        grad_output = torch.tensor(2.5, dtype=x.dtype)
+        shortcut = _reduction_jacobian(f, prep, config) * grad_output
+    expected = _upstream(f.shape, prep, config, grad_output, f.device, f.dtype)
+    torch.testing.assert_close(shortcut, expected, rtol=1e-12, atol=1e-15)
