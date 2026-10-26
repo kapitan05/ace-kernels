@@ -1,0 +1,18 @@
+# Sprint 7: soft binning at volumes where the reference runs out of memory (T4).
+name: sprint7-memory
+group: sprint7-triton-soft
+hypothesis: >-
+  v4 soft fits 288^3 (reference and v1 OOM there, Sprint 4) with peak memory ~1x
+  input, and keeps its bandwidth fraction at large volumes.
+device: cuda
+impls: [reference, v2_recompute, v4_triton]
+binnings: [soft]
+modes: [fwd_bwd]
+warmup: 2
+reps: 5
+shapes:
+  - {name: cube128, batch: 2, channels: 4, spatial: [128, 128, 128]}
+  - {name: cube192, batch: 2, channels: 4, spatial: [192, 192, 192]}
+  - {name: cube256, batch: 2, channels: 4, spatial: [256, 256, 256]}
+  - {name: cube288, batch: 2, channels: 4, spatial: [288, 288, 288]}
+  - {name: amos-b4, batch: 4, channels: 16, spatial: [176, 176, 64]}

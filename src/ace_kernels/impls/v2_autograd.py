@@ -46,10 +46,14 @@ StatsBackend = Literal["torch", "triton"]
 
 
 def _stats(prep: Prepared, config: ACEConfig, backend: StatsBackend) -> BinStats:
-    if backend == "triton":
+    if backend == "triton" and config.binning == "hard":
         from ace_kernels.kernels.hard_hist import hard_stats_triton
 
         return hard_stats_triton(prep, config)
+    if backend == "triton":
+        from ace_kernels.kernels.soft_hist import soft_stats_triton
+
+        return soft_stats_triton(prep, config)
     return bin_stats(prep, config)
 
 
@@ -144,16 +148,23 @@ def _reduction_jacobian(
 
 def _triton_input_grad(
     input: torch.Tensor,
+    target: torch.Tensor,
     config: ACEConfig,
     coef: torch.Tensor,
+    d: torch.Tensor,
     jac: torch.Tensor,
     grad_output: torch.Tensor,
 ) -> torch.Tensor:
-    from ace_kernels.kernels.hard_bwd import hard_input_grad_triton
-
     g = jac * (grad_output if grad_output.dim() == 0 else grad_output.view(jac.shape))
     probs = activate(input, config).to(torch.float32).flatten(2)  # as in forward
-    dx = hard_input_grad_triton(probs, coef, g, config)
+    if config.binning == "hard":
+        from ace_kernels.kernels.hard_bwd import hard_input_grad_triton
+
+        dx = hard_input_grad_triton(probs, coef, g, config)
+    else:
+        from ace_kernels.kernels.soft_bwd import soft_input_grad_triton
+
+        dx = soft_input_grad_triton(probs, target, coef, d, g, config)
     return dx.view(input.shape).to(input.dtype)
 
 
@@ -195,7 +206,7 @@ class _ACELoss(torch.autograd.Function):
         ctx.precomputed = mode == "grad_in_fwd" and config.reduction != "none"
         if mode == "triton_bwd":  # tiny saves only: coef and the reduction's jacobian
             jac = _reduction_jacobian(f, prep, config, present)
-            ctx.save_for_backward(input, coef, jac)
+            ctx.save_for_backward(input, target, coef, d, jac)
         elif ctx.precomputed:  # gradient for upstream 1, scaled in backward
             unit = torch.ones((), device=loss.device, dtype=loss.dtype)
             grad = _input_grad(input, target, config, coef, d, unit, present)
@@ -207,8 +218,10 @@ class _ACELoss(torch.autograd.Function):
     @staticmethod
     def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[Any, ...]:
         if ctx.mode == "triton_bwd":
-            input, coef, jac = ctx.saved_tensors
-            grad = _triton_input_grad(input, ctx.config, coef, jac, grad_output)
+            input, target, coef, d, jac = ctx.saved_tensors
+            grad = _triton_input_grad(
+                input, target, ctx.config, coef, d, jac, grad_output
+            )
             return grad, None, None, None, None
         if ctx.precomputed:
             (unit_grad,) = ctx.saved_tensors

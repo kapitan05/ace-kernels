@@ -1,0 +1,21 @@
+# Sprint 7: Triton soft binning (v3: Triton forward, v4: Triton forward + backward).
+name: sprint7-paper
+group: sprint7-triton-soft
+hypothesis: >-
+  Soft binning moves to the same per-block-histogram design as hard: v4 soft reaches
+  a similar fraction of peak bandwidth as v4 hard (~15%), is >20x faster than the
+  reference (which keeps 11x the input for backward) and >4x faster than the best
+  PyTorch version (reference_compile at 4 classes, v1_clean_compile at 16), with
+  peak memory near one input-sized tensor.
+device: cuda
+impls: [reference, reference_compile, v1_clean_compile, v2_recompute, v3_triton, v4_triton]
+binnings: [soft]
+modes: [fwd, fwd_bwd]
+cuda_graph: true
+warmup: 3
+reps: 10
+shapes:
+  - {name: kits23, batch: 2, channels: 4, spatial: [128, 128, 128]}
+  - {name: acdc17, batch: 2, channels: 4, spatial: [256, 256, 16]}
+  - {name: brats21, batch: 2, channels: 4, spatial: [224, 224, 144]}
+  - {name: amos22, batch: 2, channels: 16, spatial: [176, 176, 64]}
