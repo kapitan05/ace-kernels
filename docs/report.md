@@ -448,3 +448,54 @@ Flagged (worse than 2x the reference's own error vs truth), all explained:
   accurate). In-kernel softmax uses Triton's fast exp (~1 ulp from torch), so more
   near-edge voxels change bin than between fp32 PyTorch implementations. Candidate
   fix: precise libdevice exp in `kernels/act.py` (cost to be measured).
+
+## Sprint 8: fused softmax (v5), half precision, end-to-end training (2026-10-27)
+
+**Done**
+- 8a `v5_triton`: both kernels read logits; softmax/sigmoid in registers
+  (`kernels/act.py`, same functions forward and backward); fp16/bf16 logits read
+  natively, fp32 math; gradient in the logits' dtype. Existing kernels generalized
+  (v3/v4 call them with in-kernel activation off).
+- 8b `ace_bench.e2e`: the paper's training step (SegResNetDS 32 filters, deep
+  supervision, Dice + CE + ACE, AdamW, AMP) on synthetic learnable volumes,
+  identical batches per implementation; loss curves, step time, peak memory,
+  largest cubic patch.
+- Gate (T4): 1373 passed. Two earlier gate failures were test calibration (bound on
+  near-boundary voxels; noise-level accuracy order), fixed.
+
+### Results: Tesla T4, commit 1ab2f01 (`results/kaggle/1ab2f019d85e-run-sprint8/`)
+
+fwd+bwd p50 ms (speedup vs reference); peak MiB, fp32 logits:
+
+| shape | binning | reference | best PyTorch | v4_triton | **v5_triton** |
+|---|---|---|---|---|---|
+| kits23 | hard | 99.5; 320 | 19.3; 256 | 5.1; 128 | **3.6 (27.7x); 64** |
+| brats21 | hard | 352; 1106 | 69.8; 884 | 18.7; 441 | **13.5 (26x); 221** |
+| amos22 | hard | 804; 1301 | 109; 998 | 21.2; 484 | **14.3 (56x); 242** |
+| kits23 | soft | 184; 864 | 39.2; 688 | 7.8; 128 | **6.3 (29x); 64** |
+| brats21 | soft | 608; 3008 | 136; 2388 | 26.0; 441 | **20.8 (29x); 221** |
+| amos22 | soft | 1492; 3360 | 334; 2208 | 29.7; 484 | **22.5 (66x); 242** |
+
+- v5: 13-23% of peak bandwidth; peak memory **half of v4** (no probability tensor)
+  and 5x (hard) / 13.6x (soft) below the reference; equal to one input tensor.
+- fp16 logits: same time (the histogram kernel is compute-bound, not traffic-bound),
+  peak memory halves again (kits23: 32 MiB vs 896 MiB for the reference, soft).
+- v5 GPU time (kits23 hard, 3.57 ms): histogram kernel 2.92 ms (82%), backward
+  kernel 0.55 ms (15%), rest ~3%. **Next lever: the histogram kernel.**
+
+**End-to-end** (patch 128^3, batch 1, 4 classes, AMP, 60 steps):
+
+| binning | reference step | v4 | v5 | peak GiB (all) | largest patch: reference / v4 / v5 |
+|---|---|---|---|---|---|
+| hard | 552 ms | 501 ms (1.10x) | 499 ms (1.11x) | 3.6 | 192^3 / **224^3** / **224^3** |
+| soft | 631 ms | 512 ms (1.23x) | 510 ms (1.24x) | 3.6 | 224^3 / 224^3 / 224^3 |
+
+- Inside the full training step the network dominates: the loss was ~10% (hard) /
+  ~19% (soft) of the reference's step, so the step gets 1.1x / 1.24x faster. The
+  gain grows with the loss's share (more classes, larger volumes, cheaper networks).
+- Peak memory of the step is set by the network's activations (3.6 GiB at 128^3);
+  near the limit the loss's memory matters: hard, the reference OOMs at 224^3 where
+  v4/v5 fit (soft: all fit 224^3, all OOM 256^3).
+- Loss curves overlap visually; max step-wise difference vs reference 1.5% (hard) /
+  6.4% (soft). **Not yet attributable**: a reference-vs-reference control run
+  (cuDNN, atomics and AMP are nondeterministic) is running (`8f63165`).
