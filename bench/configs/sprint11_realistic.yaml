@@ -1,0 +1,19 @@
+# Sprint 11: noise logits vs trained-network-like logits (peaked, 93% correct).
+name: sprint11-realistic
+group: sprint11-gaps
+hypothesis: >-
+  On trained-like inputs most probabilities fall into the end bins: the reference's
+  scatter_add contention concentrates on few addresses and it gets slower; the
+  Triton kernels (per-block private histograms) are insensitive to the
+  distribution (within 10%).
+device: cuda
+impls: [reference, v5_triton, v6_triton]
+binnings: [hard, soft]
+modes: [fwd_bwd]
+warmup: 3
+reps: 10
+shapes:
+  - {name: kits23, batch: 2, channels: 4, spatial: [128, 128, 128]}
+  - {name: kits23-trained, batch: 2, channels: 4, spatial: [128, 128, 128], logit_scale: 3.0, target_bias: 8.0}
+  - {name: amos22, batch: 2, channels: 16, spatial: [176, 176, 64]}
+  - {name: amos22-trained, batch: 2, channels: 16, spatial: [176, 176, 64], logit_scale: 3.0, target_bias: 8.0}

@@ -14,3 +14,4 @@ init_filters: 8
 amp: false
 max_patch_candidates: [32]
 control_repeats: 1
+compile_modes: [none, default]

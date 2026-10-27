@@ -1,0 +1,20 @@
+# Sprint 11: v6 steps (O(1) index, tensor-core reduction, fused epilogue) vs v5.
+name: sprint11-paper
+group: sprint11-gaps
+hypothesis: >-
+  The O(1) bin index and the tensor-core reduction cut the histogram kernel's
+  compute (82% of v5's time; v5 at 13-23% of peak bandwidth vs the 60-70% target
+  of Sprint 5): v6_dot 1.5-2.5x faster than v5. The fused epilogue changes little
+  at these sizes (GPU time dominates) but cuts launches from ~55 to <= 8.
+device: cuda
+impls: [reference, v5_triton, v6_index, v6_dot, v6_triton]
+binnings: [hard, soft]
+modes: [fwd, fwd_bwd]
+cuda_graph: true
+warmup: 3
+reps: 10
+shapes:
+  - {name: kits23, batch: 2, channels: 4, spatial: [128, 128, 128]}
+  - {name: acdc17, batch: 2, channels: 4, spatial: [256, 256, 16]}
+  - {name: brats21, batch: 2, channels: 4, spatial: [224, 224, 144]}
+  - {name: amos22, batch: 2, channels: 16, spatial: [176, 176, 64]}

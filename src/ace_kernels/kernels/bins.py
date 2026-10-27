@@ -14,7 +14,7 @@ tensor-core products (fp32 accumulation) reproduce the fp32 sums.
 import triton
 import triton.language as tl
 
-DOT_COLS = 16  # value columns of the reduction matmul (literal in the kernels)
+DOT_COLS = tl.constexpr(16)  # value columns of the reduction matmul
 # split scales 2^11 (fp16 significand bits) and 2^22 appear as literals below:
 # Triton only reads module globals wrapped in tl.constexpr
 

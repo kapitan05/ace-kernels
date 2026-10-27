@@ -1,0 +1,20 @@
+# Sprint 11: training step with torch.compile of network + loss (graph breaks).
+name: sprint11-e2e
+group: sprint11-gaps
+hypothesis: >-
+  The reference loss breaks the compiled graph (data-dependent ops, 2 breaks per
+  deep-supervision level); v6_triton (custom ops) compiles without breaks, so
+  torch.compile speeds up the whole step more with v6 than with the reference.
+device: cuda
+impls: [reference, v5_triton, v6_triton]
+binnings: [hard, soft]
+classes: 4
+batch: 1
+patch: [128, 128, 128]
+steps: 60
+skip_steps: 5
+init_filters: 32
+amp: true
+max_patch_candidates: [208, 224, 240]
+control_repeats: 1
+compile_modes: [none, default]

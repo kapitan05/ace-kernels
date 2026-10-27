@@ -21,6 +21,7 @@ import json
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
@@ -38,6 +39,13 @@ from ace_kernels import ACEConfig, ace_loss
 from ace_kernels.config import Binning
 
 MiB = 2**20
+
+
+CompileMode = Literal["none", "default", "reduce-overhead"]
+
+
+def label(impl: str, mode: CompileMode) -> str:
+    return impl if mode == "none" else f"{impl} +{mode}"
 
 
 class E2EConfig(BaseModel):
@@ -63,6 +71,9 @@ class E2EConfig(BaseModel):
     # difference from itself is the run-to-run noise floor (cuDNN, atomics, AMP)
     # against which the optimized losses' curve differences are judged.
     control_repeats: int = Field(default=0, ge=0)
+    # torch.compile of network + loss (Sprint 11): every impl also runs with each
+    # mode, labelled "<impl> +<mode>"; graph breaks recorded in compile.parquet
+    compile_modes: list[CompileMode] = ["none"]
 
     @classmethod
     def from_yaml(cls, path: Path) -> "E2EConfig":
@@ -77,6 +88,16 @@ class StepRow(BaseModel):
     ace: float
     step_ms: float | None
     peak_mib: float | None
+
+
+class CompileRow(BaseModel):
+    impl: str
+    binning: str
+    mode: str
+    status: Literal["ok", "error"]
+    graphs: int | None = None
+    graph_breaks: int | None = None
+    reasons: str | None = None  # first break reasons
 
 
 class ProbeRow(BaseModel):
@@ -151,29 +172,50 @@ def _build(cfg: E2EConfig, impl: str, binning: Binning) -> tuple[Any, Any, Any, 
     return model, paper_loss, loss_fn, opt
 
 
+Forward = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+
+
+def _forward(model: Any, loss_fn: Any, mode: CompileMode) -> Forward:
+    """Network + deep-supervision loss, optionally under ``torch.compile``."""
+
+    def fwd(image: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        loss: torch.Tensor = loss_fn(model(image), labels)
+        return loss
+
+    if mode == "none":
+        return fwd
+    compiled: Forward = torch.compile(fwd, mode=None if mode == "default" else mode)
+    return compiled
+
+
+def _autocast(cfg: E2EConfig) -> Any:
+    use_amp = cfg.amp and cfg.device == "cuda"
+    return torch.autocast("cuda", dtype=torch.float16) if use_amp else nullcontext()
+
+
 def _step(
     cfg: E2EConfig,
-    model: Any,
-    loss_fn: Any,
+    fwd: Forward,
     opt: Any,
     scaler: Any,
     image: torch.Tensor,
     labels: torch.Tensor,
 ) -> torch.Tensor:
-    use_amp = cfg.amp and cfg.device == "cuda"
-    ctx = torch.autocast("cuda", dtype=torch.float16) if use_amp else nullcontext()
     opt.zero_grad(set_to_none=True)
-    with ctx:
-        loss: torch.Tensor = loss_fn(model(image), labels)
+    with _autocast(cfg):
+        loss = fwd(image, labels)
     scaler.scale(loss).backward()
     scaler.step(opt)
     scaler.update()
     return loss.detach()
 
 
-def train_curve(cfg: E2EConfig, impl: str, binning: Binning) -> list[StepRow]:
+def train_curve(
+    cfg: E2EConfig, impl: str, binning: Binning, mode: CompileMode = "none"
+) -> list[StepRow]:
     model, paper_loss, loss_fn, opt = _build(cfg, impl, binning)
     model.train()
+    fwd = _forward(model, loss_fn, mode)
     scaler = torch.amp.GradScaler(enabled=cfg.amp and cfg.device == "cuda")
     rows = []
     for step in range(cfg.steps):
@@ -187,17 +229,17 @@ def train_curve(cfg: E2EConfig, impl: str, binning: Binning) -> list[StepRow]:
                 torch.cuda.Event(enable_timing=True),
             )
             start.record()
-            loss = _step(cfg, model, loss_fn, opt, scaler, image, labels)
+            loss = _step(cfg, fwd, opt, scaler, image, labels)
             end.record()
             torch.cuda.synchronize()
             ms, peak = start.elapsed_time(end), torch.cuda.max_memory_allocated() / MiB
         else:
             t0 = time.perf_counter()
-            loss = _step(cfg, model, loss_fn, opt, scaler, image, labels)
+            loss = _step(cfg, fwd, opt, scaler, image, labels)
             ms, peak = (time.perf_counter() - t0) * 1e3, None
         rows.append(
             StepRow(
-                impl=impl,
+                impl=label(impl, mode),
                 binning=binning,
                 step=step,
                 loss=float(loss),
@@ -207,7 +249,8 @@ def train_curve(cfg: E2EConfig, impl: str, binning: Binning) -> list[StepRow]:
             )
         )
         print(
-            f"{impl:12s} {binning} step {step:3d} loss {float(loss):.4f} {ms:8.1f} ms",
+            f"{label(impl, mode):12s} {binning} step {step:3d} "
+            f"loss {float(loss):.4f} {ms:8.1f} ms",
             file=sys.stderr,
             flush=True,
         )
@@ -218,12 +261,13 @@ def probe_patch(cfg: E2EConfig, impl: str, binning: Binning, size: int) -> Probe
     """One training step at a cubic patch: does it fit in memory?"""
     try:
         model, _, loss_fn, opt = _build(cfg, impl, binning)
+        fwd = _forward(model, loss_fn, "none")
         scaler = torch.amp.GradScaler(enabled=cfg.amp and cfg.device == "cuda")
         image, labels = synthetic_batch(0, cfg, [size] * 3, cfg.device)
         if cfg.device == "cuda":
             torch.cuda.reset_peak_memory_stats()
         for _ in range(2):  # second step: optimizer state allocated
-            _step(cfg, model, loss_fn, opt, scaler, image, labels)
+            _step(cfg, fwd, opt, scaler, image, labels)
         peak = torch.cuda.max_memory_allocated() / MiB if cfg.device == "cuda" else None
         return ProbeRow(
             impl=impl, binning=binning, patch=size, status="ok", peak_mib=peak
@@ -237,6 +281,35 @@ def probe_patch(cfg: E2EConfig, impl: str, binning: Binning, size: int) -> Probe
             patch=size,
             status="error",
             error=f"{type(exc).__name__}: {exc}"[:300],
+        )
+
+
+def explain(cfg: E2EConfig, impl: str, binning: Binning, mode: str) -> CompileRow:
+    """Graph breaks of network + loss under ``torch.compile`` (dynamo explain)."""
+    try:
+        model, _, loss_fn, _ = _build(cfg, impl, binning)
+        image, labels = synthetic_batch(0, cfg, cfg.patch, cfg.device)
+        fwd = _forward(model, loss_fn, "none")
+        with _autocast(cfg):
+            out = torch._dynamo.explain(fwd)(image, labels)
+        first = {str(b.reason).splitlines()[0][:100] for b in out.break_reasons}
+        reasons = "; ".join(sorted(first))
+        return CompileRow(
+            impl=impl,
+            binning=binning,
+            mode=mode,
+            status="ok",
+            graphs=out.graph_count,
+            graph_breaks=out.graph_break_count,
+            reasons=reasons or None,
+        )
+    except Exception as exc:
+        return CompileRow(
+            impl=impl,
+            binning=binning,
+            mode=mode,
+            status="error",
+            reasons=f"{type(exc).__name__}: {exc}"[:300],
         )
 
 
@@ -263,7 +336,11 @@ def worker() -> None:
     task = json.loads(sys.stdin.read())
     cfg = E2EConfig.model_validate(task["config"])
     if task["kind"] == "curve":
-        rows: list[BaseModel] = list(train_curve(cfg, task["impl"], task["binning"]))
+        rows: list[BaseModel] = list(
+            train_curve(cfg, task["impl"], task["binning"], task.get("mode", "none"))
+        )
+    elif task["kind"] == "explain":
+        rows = [explain(cfg, task["impl"], task["binning"], task["mode"])]
     else:
         rows = [probe_patch(cfg, task["impl"], task["binning"], task["size"])]
     print(_MARKER + json.dumps([r.model_dump() for r in rows]), flush=True)
@@ -285,11 +362,20 @@ def run(cfg: E2EConfig, out_root: Path, use_wandb: bool) -> Path:
     (out / "meta.json").write_text(json.dumps(meta, indent=2))
     base = {"config": cfg.model_dump()}
     steps: list[dict[str, Any]] = []
-    for binning, impl in itertools.product(cfg.binnings, cfg.impls):
-        rows = _isolated({**base, "kind": "curve", "impl": impl, "binning": binning})
+    compiled = [m for m in cfg.compile_modes if m != "none"]
+    for binning, impl, mode in itertools.product(
+        cfg.binnings, cfg.impls, cfg.compile_modes
+    ):
+        task = {**base, "kind": "curve", "impl": impl, "binning": binning}
+        rows = _isolated({**task, "mode": mode})
         if not rows:
-            print(f"curve {impl} {binning}: worker crashed (see stderr)", flush=True)
+            name = label(impl, mode)
+            print(f"curve {name} {binning}: worker crashed (see stderr)", flush=True)
         steps += rows
+    explained: list[dict[str, Any]] = []
+    for binning, impl in itertools.product(cfg.binnings, cfg.impls if compiled else []):
+        task = {**base, "kind": "explain", "impl": impl, "binning": binning}
+        explained += _isolated({**task, "mode": compiled[0]})
     for binning, rep in itertools.product(cfg.binnings, range(cfg.control_repeats)):
         rows = _isolated(
             {**base, "kind": "curve", "impl": "reference", "binning": binning}
@@ -333,6 +419,8 @@ def run(cfg: E2EConfig, out_root: Path, use_wandb: bool) -> Path:
     }
     pl.DataFrame(steps, schema=step_schema).write_parquet(out / "steps.parquet")
     pl.DataFrame(probes, schema=probe_schema).write_parquet(out / "probes.parquet")
+    if explained:
+        pl.DataFrame(explained).write_parquet(out / "compile.parquet")
     print(write_e2e_summary(out))
     if use_wandb:
         from ace_bench.tracking import mirror_e2e

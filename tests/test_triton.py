@@ -367,7 +367,8 @@ def _near_edge_values(table: torch.Tensor, ulps: int = 8) -> torch.Tensor:
 @pytest.mark.parametrize("binning", ["hard", "soft"])
 def test_direct_index_exact(num_bins: int, right: bool, binning: Binning) -> None:
     """O(1) index == the K-compare loop (== torch.bucketize) at every near-edge
-    float32: all statistics bit-identical (same per-voxel arithmetic)."""
+    float32. Hard: counts exact (one moved voxel changes a count by 1). Soft:
+    weights within atomic-order rounding (one moved voxel: ~0.5 of ~1e3-1e5)."""
     from ace_kernels.common import hard_edges, soft_half_boundaries
     from ace_kernels.kernels.hard_hist import hard_stats_fused
     from ace_kernels.kernels.soft_hist import soft_stats_fused
@@ -384,9 +385,12 @@ def test_direct_index_exact(num_bins: int, right: bool, binning: Binning) -> Non
     fused = hard_stats_fused if binning == "hard" else soft_stats_fused
     loop = fused(p, target, config, direct=False)
     direct = fused(p, target, config, direct=True)
+    if binning == "hard":
+        assert torch.equal(direct.weight, loop.weight)
+    # float atomics add in a different order on every run: not bit-identical
     for a, b in ((direct.weight, loop.weight), (direct.sum_p, loop.sum_p)):
-        assert torch.equal(a, b)
-    assert torch.equal(direct.sum_gt, loop.sum_gt)
+        torch.testing.assert_close(a, b, rtol=1e-6, atol=1e-3)
+    torch.testing.assert_close(direct.sum_gt, loop.sum_gt, rtol=1e-6, atol=1e-3)
 
 
 @pytest.mark.parametrize("binning", ["hard", "soft"])

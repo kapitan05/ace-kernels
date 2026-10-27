@@ -443,6 +443,9 @@ def write_e2e_summary(out: Path) -> str:
         lines.append("")
     if probes.height:
         lines += ["## Max-patch probes", "", to_markdown(probes), ""]
+    if (out / "compile.parquet").exists():
+        compiled = pl.read_parquet(out / "compile.parquet")
+        lines += ["## torch.compile graph breaks", "", to_markdown(compiled), ""]
     text = "\n".join(lines)
     (out / "summary.md").write_text(text)
     return text

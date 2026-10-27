@@ -1,0 +1,17 @@
+# Sprint 11 accuracy: v6 steps vs float64 truth (loss and L2 gradient).
+name: sprint11-verify
+group: sprint11-gaps
+hypothesis: >-
+  The v6 steps are as accurate as v5 against a float64 truth: identical bins
+  (exact O(1) index), fp32-exact tensor-core sums (3-way fp16 split).
+device: cuda
+impls: [reference, v5_triton, v6_index, v6_dot, v6_triton]
+binnings: [soft, hard]
+modes: [fwd_bwd]
+warmup: 1
+reps: 2
+shapes:
+  - {name: kits23, batch: 2, channels: 4, spatial: [128, 128, 128]}
+  - {name: brats21, batch: 2, channels: 4, spatial: [224, 224, 144]}
+  - {name: amos22, batch: 2, channels: 16, spatial: [176, 176, 64]}
+  - {name: cube256, batch: 2, channels: 4, spatial: [256, 256, 256]}

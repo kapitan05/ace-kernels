@@ -1,0 +1,19 @@
+# Sprint 11: the four deep-supervision levels of SegResNetDS at a 128^3 patch.
+name: sprint11-deepsup
+group: sprint11-gaps
+hypothesis: >-
+  The small levels (32^3, 16^3) are launch-bound: v5 (~55 launches) sits near its
+  launch floor there; v6_triton's fused epilogue (<= 8 launches) makes them 2-5x
+  faster. A CUDA graph helps v5 at small sizes and is unnecessary for v6.
+device: cuda
+impls: [reference, v5_triton, v6_triton]
+binnings: [hard, soft]
+modes: [fwd_bwd]
+cuda_graph: true
+warmup: 3
+reps: 20
+shapes:
+  - {name: ds0-128, batch: 1, channels: 4, spatial: [128, 128, 128]}
+  - {name: ds1-64, batch: 1, channels: 4, spatial: [64, 64, 64]}
+  - {name: ds2-32, batch: 1, channels: 4, spatial: [32, 32, 32]}
+  - {name: ds3-16, batch: 1, channels: 4, spatial: [16, 16, 16]}
