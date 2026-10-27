@@ -2,7 +2,7 @@
 
 ## Summary (Tesla T4, 2026-10-27)
 
-**Goal.** Make the mL1-ACE calibration loss (Barfoot et al., cai4cai/Average-Calibration-Losses)
+**Goal.** Make the mL1-ACE calibration loss (cai4cai/Average-Calibration-Losses, arXiv 2506.03942)
 fast and memory-lean on the GPU without changing what it computes.
 
 **Result** (forward + backward, paper training shapes, batch 2; `v5_triton`, Triton
