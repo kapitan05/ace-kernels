@@ -5,7 +5,8 @@
   PyTorch ops, registered as ``torch.library`` custom ops so ``torch.compile`` of a
   whole training step treats the loss as two opaque nodes (no graph break).
 - ``v6_precise``: v6_triton with libdevice ``exp`` instead of Triton's fast one
-  (accuracy vs speed; autograd.Function, not the custom op).
+  (bins like ``torch.softmax``; T4: L2 gradient error at brats21 hard 2.9e-4 ->
+  6.4e-5 = the reference's, for 0-6% time). Used by ``module.py``.
 - ``v6_dot``:    side branch, v6_index + tensor-core histogram reduction
   (``kernels/bins.put3``): 3.6-4x slower on a T4 (no tensor-core ``tl.dot`` on
   sm_75); kept to re-measure on sm_80+ GPUs.
@@ -110,9 +111,13 @@ class _V6Loss(torch.autograd.Function):
         return dx, None, None, None
 
 
-# v6_triton: no tensor-core reduction. Measured on a T4 (sm_75, no Triton
-# tensor-core path): v6_dot 3.6-4x *slower* than v6_index. To re-test on sm_80+.
-FULL = Options(direct=True, epilogue=True)
+# The custom ops: no tensor-core reduction (measured on a T4, sm_75, without a
+# Triton tensor-core path: v6_dot 3.6-4x *slower* than v6_index; to re-test on
+# sm_80+). ``precise`` selects libdevice exp (v6_precise) or the fast one.
+
+
+def _op_options(precise: bool) -> Options:
+    return Options(direct=True, epilogue=True, precise=precise)
 
 
 @functools.lru_cache(maxsize=64)
@@ -134,15 +139,20 @@ config_arg = cast(
 
 
 @torch.library.custom_op("ace_kernels::v6_forward", mutates_args=())
-def v6_forward(input: torch.Tensor, target: torch.Tensor, config_json: str) -> Outputs:
+def v6_forward(
+    input: torch.Tensor, target: torch.Tensor, config_json: str, precise: bool
+) -> Outputs:
     """mL1-ACE forward: (loss, coef, d, jac); see ``_forward``."""
-    loss, coef, d, jac = _forward(input, target, _config(config_json), FULL)
+    opt = _op_options(precise)
+    loss, coef, d, jac = _forward(input, target, _config(config_json), opt)
     # custom ops may not return views of internal buffers: copy the "none" view
     return loss.clone() if loss.dim() else loss, coef, d, jac
 
 
 @v6_forward.register_fake
-def _(input: torch.Tensor, target: torch.Tensor, config_json: str) -> Outputs:
+def _(
+    input: torch.Tensor, target: torch.Tensor, config_json: str, precise: bool
+) -> Outputs:
     config = _config(config_json)
     b, c = input.shape[:2]
     cl = c - (1 if (not config.include_background and c > 1) else 0)
@@ -164,11 +174,11 @@ def v6_backward(
     jac: torch.Tensor,
     grad_output: torch.Tensor,
     config_json: str,
+    precise: bool,
 ) -> torch.Tensor:
     """d loss / d input; see ``_backward``."""
-    return _backward(
-        input, target, coef, d, jac, grad_output, _config(config_json), FULL
-    )
+    config, opt = _config(config_json), _op_options(precise)
+    return _backward(input, target, coef, d, jac, grad_output, config, opt)
 
 
 @v6_backward.register_fake
@@ -180,37 +190,44 @@ def _(
     jac: torch.Tensor,
     grad_output: torch.Tensor,
     config_json: str,
+    precise: bool,
 ) -> torch.Tensor:
     return torch.empty_like(input)
 
 
 def _setup_context(ctx: Any, inputs: tuple[Any, ...], output: Outputs) -> None:
-    input, target, config_json = inputs
+    input, target, config_json, precise = inputs
     _, coef, d, jac = output
-    ctx.config_json = config_json
+    ctx.config_json, ctx.precise = config_json, precise
     ctx.set_materialize_grads(False)  # coef / d / jac get no gradient: no zero fills
     ctx.save_for_backward(input, target, coef, d, jac)
 
 
 def _op_backward(
     ctx: Any, grad_loss: torch.Tensor, *_unused: torch.Tensor
-) -> tuple[torch.Tensor | None, None, None]:
+) -> tuple[torch.Tensor | None, None, None, None]:
     input, target, coef, d, jac = ctx.saved_tensors
-    dx = v6_backward(input, target, coef, d, jac, grad_loss, ctx.config_json)
-    return dx, None, None
+    dx = v6_backward(
+        input, target, coef, d, jac, grad_loss, ctx.config_json, ctx.precise
+    )
+    return dx, None, None, None
 
 
 v6_forward.register_autograd(_op_backward, setup_context=_setup_context)
 
 
-def _entry(opt: Options | None) -> Any:
+def _entry(opt: Options | bool) -> Any:
+    """Registry function: ``Options`` -> autograd.Function; a bool -> the custom
+    ops with that ``precise`` flag."""
+
     def impl(
         input: torch.Tensor, target: torch.Tensor, config: ACEConfig
     ) -> torch.Tensor:
         if input.dtype == torch.float64:  # gradcheck path: kernels are fp32 inside
             return _apply(input, target, config, "recompute", "torch")
-        if opt is None:
-            loss: torch.Tensor = v6_forward(input, target, config_arg(config))[0]
+        if isinstance(opt, bool):
+            args = (input, target, config_arg(config), opt)
+            loss: torch.Tensor = v6_forward(*args)[0]
         else:
             loss = _V6Loss.apply(input, target, config, opt)
         return loss
@@ -227,9 +244,9 @@ if HAS_TRITON:
     )(_entry(Options(direct=True)))
     register(
         "v6_precise",
-        description="v6_triton with libdevice exp (as torch.softmax) in the kernels",
+        description="v6_triton with libdevice exp (as torch.softmax): the default",
         devices=_CUDA,
-    )(_entry(Options(direct=True, epilogue=True, precise=True)))
+    )(_entry(True))
     register(
         "v6_dot",
         description="v6_index + tensor-core histogram reduction (side branch)",
@@ -239,4 +256,4 @@ if HAS_TRITON:
         "v6_triton",
         description="v6_index + one-launch epilogue, as torch.library custom ops",
         devices=_CUDA,
-    )(_entry(None))
+    )(_entry(False))

@@ -420,7 +420,7 @@ def test_dot_reduction_matches_sums(
     torch.testing.assert_close(dot.sum_p, sums.sum_p, rtol=1e-5, atol=1e-5)
 
 
-V6 = ["v6_index", "v6_dot", "v6_triton"]
+V6 = ["v6_index", "v6_dot", "v6_triton", "v6_precise"]
 
 
 @pytest.mark.parametrize("impl", V6)
@@ -450,8 +450,9 @@ def test_v6_matches_v5(
     assert mismatch.flatten(2).any(1).float().mean().item() <= 1e-3
 
 
+@pytest.mark.parametrize("impl", ["v6_triton", "v6_precise"])
 @pytest.mark.parametrize("binning", ["hard", "soft"])
-def test_v6_launches(binning: Binning) -> None:
+def test_v6_launches(binning: Binning, impl: str) -> None:
     """Fused epilogue: a handful of launches per fwd + bwd (v5: ~55)."""
     from torch.profiler import ProfilerActivity, profile
 
@@ -461,17 +462,18 @@ def test_v6_launches(binning: Binning) -> None:
     x, y = make_inputs(InputSpec(2, 4, (32, 32, 32)), config, "cuda")
     x.requires_grad_(True)
     for _ in range(2):  # autotune + compile outside the profile
-        torch.autograd.backward(ace_loss(x, y, config, impl="v6_triton"))
+        torch.autograd.backward(ace_loss(x, y, config, impl=impl))
     torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
-        torch.autograd.backward(ace_loss(x, y, config, impl="v6_triton"))
+        torch.autograd.backward(ace_loss(x, y, config, impl=impl))
         torch.cuda.synchronize()
     kernels = [e for e in prof.events() if e.device_type.name == "CUDA"]
     assert len(kernels) <= 8, [e.name for e in kernels]
 
 
+@pytest.mark.parametrize("impl", ["v6_triton", "v6_precise"])
 @pytest.mark.parametrize("binning", ["hard", "soft"])
-def test_v6_compiles_fullgraph(binning: Binning) -> None:
+def test_v6_compiles_fullgraph(binning: Binning, impl: str) -> None:
     """torch.compile of network + loss without graph breaks; same result as eager."""
     from ace_kernels import ace_loss
 
@@ -480,7 +482,7 @@ def test_v6_compiles_fullgraph(binning: Binning) -> None:
     net = torch.nn.Conv3d(4, 4, 3, padding=1).cuda()
 
     def step(inp: torch.Tensor) -> torch.Tensor:
-        return ace_loss(net(inp), y, config, impl="v6_triton")
+        return ace_loss(net(inp), y, config, impl=impl)
 
     results = []
     for fn in (step, torch.compile(step, fullgraph=True)):

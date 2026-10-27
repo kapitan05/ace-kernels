@@ -6,7 +6,7 @@ target)`` as the upstream classes, so switching is one import::
     from ace_kernels.module import HardL1ACELoss  # was: from losses.hardl1ace ...
 
 Extra keyword-only argument ``impl``: ``"auto"`` (default) runs the fastest
-implementation for the input's device (Triton ``v6_triton`` on CUDA, the
+implementation for the input's device (Triton ``v6_precise`` on CUDA, the
 handwritten-backward PyTorch ``v2_recompute`` elsewhere); any registered name
 (``ace_kernels.available_impls()``) can be forced, ``"reference"`` included.
 """
@@ -21,7 +21,7 @@ from ace_kernels.config import ACEConfig, Activation, Binning
 from ace_kernels.kernels import HAS_TRITON
 from ace_kernels.registry import get_impl
 
-FAST_CUDA = "v6_triton"
+FAST_CUDA = "v6_precise"
 FAST_OTHER = "v2_recompute"
 
 Weight = Sequence[float] | float | int | torch.Tensor | None

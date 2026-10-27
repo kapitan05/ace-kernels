@@ -42,6 +42,7 @@ LADDER = [
     ("v5_triton", "S8", "+ softmax fused into both kernels"),
     ("v6_index", "S11", "+ O(1) bin index"),
     ("v6_triton", "S11", "+ one-launch epilogue, torch.library op"),
+    ("v6_precise", "S11", "+ libdevice exp (bins like torch.softmax)"),
     ("v6_dot", "S11", "side branch: v6_index + tensor-core reduction"),
 ]
 PAPER_SHAPES = ["kits23", "acdc17", "brats21", "amos22"]
