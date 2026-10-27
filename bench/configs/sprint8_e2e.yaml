@@ -1,6 +1,6 @@
 # Sprint 8b: the loss inside the paper's training step (SegResNetDS, deep
 # supervision, Dice + CE + mL1-ACE, AdamW, AMP), synthetic learnable volumes.
-name: sprint8-e2e
+name: sprint8-e2e-control
 group: sprint8-e2e
 hypothesis: >-
   The optimized losses train identically (loss curves overlap the reference within
@@ -17,4 +17,5 @@ steps: 60
 skip_steps: 5
 init_filters: 32
 amp: true
-max_patch_candidates: [128, 160, 192, 224, 256]
+max_patch_candidates: [192, 208, 224, 240]
+control_repeats: 1

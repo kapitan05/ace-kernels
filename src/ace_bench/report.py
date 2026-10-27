@@ -396,13 +396,30 @@ def write_e2e_summary(out: Path) -> str:
             table = table.join(best, on="impl", how="left")
         lines += [f"## {binning} binning", "", to_markdown(table), ""]
         fig, axes = plt.subplots(1, 2, figsize=(10, 3.6), facecolor=SURFACE)
-        for i, impl in enumerate(cfg["impls"]):
+        impls = steps.filter(pl.col("binning") == binning)["impl"].unique(
+            maintain_order=True
+        )
+        for i, impl in enumerate(impls.to_list()):
             d = steps.filter((pl.col("binning") == binning) & (pl.col("impl") == impl))
-            if d.height == 0:
-                continue
             color = SERIES[i % len(SERIES)]
-            axes[0].plot(d["step"], d["loss"], color=color, linewidth=2, label=impl)
-            axes[1].plot(d["step"], d["step_ms"], color=color, linewidth=2, label=impl)
+            style = "--" if "rerun" in impl else "-"  # control curves dashed
+            axes[0].plot(
+                d["step"],
+                d["loss"],
+                color=color,
+                linewidth=2,
+                label=impl,
+                linestyle=style,
+            )
+            timed_d = d.filter(pl.col("step") >= cfg["skip_steps"])  # no warmup spike
+            axes[1].plot(
+                timed_d["step"],
+                timed_d["step_ms"],
+                color=color,
+                linewidth=2,
+                label=impl,
+                linestyle=style,
+            )
         for ax, title in zip(axes, ("Training loss", "Step time, ms"), strict=True):
             ax.set_facecolor(SURFACE)
             ax.set_title(title, fontsize=9, color=TEXT, loc="left")

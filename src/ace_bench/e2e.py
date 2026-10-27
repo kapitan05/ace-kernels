@@ -59,6 +59,10 @@ class E2EConfig(BaseModel):
     lr: float = 1e-4
     seed: int = 0
     max_patch_candidates: list[int] = []  # cubic sizes to probe (empty: skip)
+    # Train the reference this many extra times (same seed, same batches): its
+    # difference from itself is the run-to-run noise floor (cuDNN, atomics, AMP)
+    # against which the optimized losses' curve differences are judged.
+    control_repeats: int = Field(default=0, ge=0)
 
     @classmethod
     def from_yaml(cls, path: Path) -> "E2EConfig":
@@ -285,6 +289,13 @@ def run(cfg: E2EConfig, out_root: Path, use_wandb: bool) -> Path:
         rows = _isolated({**base, "kind": "curve", "impl": impl, "binning": binning})
         if not rows:
             print(f"curve {impl} {binning}: worker crashed (see stderr)", flush=True)
+        steps += rows
+    for binning, rep in itertools.product(cfg.binnings, range(cfg.control_repeats)):
+        rows = _isolated(
+            {**base, "kind": "curve", "impl": "reference", "binning": binning}
+        )
+        for r in rows:  # same impl, labelled as a control curve
+            r["impl"] = f"reference (rerun {rep + 1})"
         steps += rows
     probes: list[dict[str, Any]] = []
     for binning, impl in itertools.product(cfg.binnings, cfg.impls):
