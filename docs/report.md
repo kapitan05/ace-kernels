@@ -48,7 +48,7 @@ Sprint 11; full table: `docs/ablation/ablation.md`):
   mean_p ~ mean_y), relative L2 errors are; Triton's fast exp moves near-edge voxels
   (fixed: libdevice exp, +0-6%); a tensor-core histogram reduction is 4-8x *slower*
   on a T4 (sm_75, no Triton tensor-core path).
-- **Limits / next.** 3.5-7x above the bandwidth floor: 83-86% of the time is the
+- **Limits / next.** 3.5-8x above the bandwidth floor: 83-86% of the time is the
   histogram kernel's per-block reduction. Re-measure on the RTX PRO 6000 (incl. the
   tensor-core variant), then the full paper replication (calibration metrics,
   reliability diagrams, seeds). Kaggle T4 has no `ncu` (hardware counters blocked).
