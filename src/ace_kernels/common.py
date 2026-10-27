@@ -159,6 +159,28 @@ def finalize(
     return reduce_classes(torch.nanmean(per_bin_error, dim=-1), prep, config)
 
 
+def class_weights(config: ACEConfig, n_ch: int) -> list[float] | None:
+    """Per-class loss weights (None: unweighted), validated like the reference.
+
+    Checked on the Python config values: no device -> host sync.
+    """
+    if config.weight is None or n_ch == 1:
+        return None
+    weights = (
+        [config.weight] * n_ch
+        if isinstance(config.weight, float)
+        else list(config.weight)
+    )
+    if len(weights) != n_ch:
+        raise ValueError(
+            "the length of the `weight` sequence should be the same as the "
+            "number of classes (excluding background if include_background=False)"
+        )
+    if min(weights) < 0:
+        raise ValueError("the value/values of the `weight` should be no less than 0.")
+    return weights
+
+
 def reduce_classes(
     f: torch.Tensor,
     prep: Prepared,
@@ -174,23 +196,8 @@ def reduce_classes(
         if present is None:
             present = nonempty_classes(prep)
         f = f * present.to(f.dtype)
-    n_ch = f.shape[1]
-    if config.weight is not None and n_ch != 1:
-        # checked on the Python config values: no device -> host sync
-        weights = (
-            [config.weight] * n_ch
-            if isinstance(config.weight, float)
-            else list(config.weight)
-        )
-        if len(weights) != n_ch:
-            raise ValueError(
-                "the length of the `weight` sequence should be the same as the "
-                "number of classes (excluding background if include_background=False)"
-            )
-        if min(weights) < 0:
-            raise ValueError(
-                "the value/values of the `weight` should be no less than 0."
-            )
+    weights = class_weights(config, f.shape[1])
+    if weights is not None:
         # per-class Python scalars: no host->device copy (CUDA-graph capturable)
         f = torch.cat([f[:, i : i + 1] * w for i, w in enumerate(weights)], dim=1)
     if config.reduction == "mean":

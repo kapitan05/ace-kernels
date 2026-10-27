@@ -9,6 +9,12 @@ bin and statistic. Atomics per slice drop from N to ``3 K * N / BLOCK``.
 Bins are counted against the reference's float32 edge tensor with the same
 comparison as ``torch.bucketize``: ``right=False`` -> number of edges < p,
 ``right=True`` -> number of edges <= p. Bit-identical bin assignment.
+
+Sprint 11 options (constexpr, ``bins.py``): ``DIRECT`` computes that count in O(1)
+instead of K compares; ``DOT`` reduces the block with a tensor-core matmul
+(one-hot ``[KP, BLOCK]`` @ values ``[BLOCK, 16]``) instead of three
+``[BLOCK, KP]`` multiply-and-sum passes. ``DOT`` needs p in [0, 1] and 0/1 targets
+(activation + class-index labels), where it is exact up to fp32 summation order.
 """
 
 import torch
@@ -24,6 +30,14 @@ from ace_kernels.kernels.act import (
     activate_tl,
     channel_pow2,
     softmax_stats,
+)
+from ace_kernels.kernels.bins import (
+    DOT_COLS,
+    column,
+    dot_bins,
+    join3,
+    put3,
+    sorted_count,
 )
 
 _CONFIGS = [
@@ -51,6 +65,9 @@ def _hard_hist_kernel(
     ACT: tl.constexpr,  # activation applied in-kernel (act.py)
     RIGHT: tl.constexpr,
     USE_LABELS: tl.constexpr,
+    DIRECT: tl.constexpr,  # O(1) bin index (bins.sorted_count)
+    DOT: tl.constexpr,  # tensor-core reduction (bins.put3 / join3)
+    PRECISE: tl.constexpr,  # libdevice exp in the activation
     BLOCK: tl.constexpr,
 ):
     # voxel blocks on grid axis 0 (up to 2^31 - 1 programs); axis 1 is limited to
@@ -65,26 +82,39 @@ def _hard_hist_kernel(
     m = tl.zeros([BLOCK], dtype=tl.float32)
     s = tl.full([BLOCK], 1.0, dtype=tl.float32)
     if ACT == 1:
-        m, s = softmax_stats(x_ptr, b, offs, valid, N, C, CP)
+        m, s = softmax_stats(x_ptr, b, offs, valid, N, C, CP, PRECISE)
     for c in range(OFFSET, C):
         base = (b * C + c) * N
         x = tl.load(x_ptr + base + offs, mask=valid, other=0.0).to(tl.float32)
-        p = tl.where(valid, activate_tl(x, m, s, ACT), 0.0)
-        idx = tl.zeros([BLOCK], dtype=tl.int32)
-        for k in tl.static_range(K):
-            edge = tl.load(edges_ptr + k)
-            if RIGHT:
-                idx += (p >= edge).to(tl.int32)
-            else:
-                idx += (p > edge).to(tl.int32)
+        p = tl.where(valid, activate_tl(x, m, s, ACT, PRECISE), 0.0)
+        if DIRECT:
+            idx = sorted_count(p, edges_ptr, K, RIGHT)
+        else:
+            idx = tl.zeros([BLOCK], dtype=tl.int32)
+            for k in tl.static_range(K):
+                edge = tl.load(edges_ptr + k)
+                if RIGHT:
+                    idx += (p >= edge).to(tl.int32)
+                else:
+                    idx += (p > edge).to(tl.int32)
         if USE_LABELS:
             y = ((label == c) & valid).to(tl.float32)
         else:
             y = tl.load(onehot_ptr + base + offs, mask=valid, other=0.0).to(tl.float32)
-        hit = ((idx[:, None] == bins[None, :]) & valid[:, None]).to(tl.float32)
-        count = tl.sum(hit, axis=0)
-        sum_p = tl.sum(hit * p[:, None], axis=0)
-        sum_y = tl.sum(hit * y[:, None], axis=0)
+        if DOT:
+            col = tl.arange(0, DOT_COLS)[None, :]
+            vals = tl.where(col == 0, 1.0, tl.where(col == 1, y[:, None], 0.0))
+            vals = put3(vals, col, 2, p)
+            onehot_t = (bins[:, None] == idx[None, :]) & valid[None, :]
+            acc = tl.dot(onehot_t.to(tl.float16), vals.to(tl.float16))  # [KP, 16]
+            count = column(acc, col, 0)
+            sum_y = column(acc, col, 1)
+            sum_p = join3(acc, col, 2)
+        else:
+            hit = ((idx[:, None] == bins[None, :]) & valid[:, None]).to(tl.float32)
+            count = tl.sum(hit, axis=0)
+            sum_p = tl.sum(hit * p[:, None], axis=0)
+            sum_y = tl.sum(hit * y[:, None], axis=0)
         out = out_ptr + (b * (C - OFFSET) + c - OFFSET) * K + bins
         tl.atomic_add(out, count, mask=bin_ok)
         tl.atomic_add(out + BCK, sum_p, mask=bin_ok)
@@ -123,25 +153,36 @@ def hard_stats_triton(prep: Prepared, config: ACEConfig) -> BinStats:
         ACT=ACT_NONE,
         RIGHT=config.right,
         USE_LABELS=use_labels,
+        DIRECT=False,
+        DOT=False,
+        PRECISE=False,
     )
     count, sum_p, sum_y = out.unbind(0)
     return BinStats(count, sum_p, sum_y, count == 0)
 
 
 def hard_stats_fused(
-    x: torch.Tensor, target: torch.Tensor, config: ACEConfig
+    x: torch.Tensor,
+    target: torch.Tensor,
+    config: ACEConfig,
+    direct: bool = False,
+    dot: bool = False,
+    precise: bool = False,
 ) -> BinStats:
     """Hard statistics straight from logits ``x`` [B, C, N] (activation in-kernel).
 
     ``target``: ``[B, N]`` class indices (original numbering) when ``to_onehot_y``
     and C > 1, else ``[B, C, N]`` targets. Covers the loss channels (C - 1 when the
-    background is dropped).
+    background is dropped). ``direct`` / ``dot`` / ``precise``: Sprint 11 options
+    (``dot`` is used only where it is exact: activation and class-index labels).
     """
     b, c, n = x.shape
     k = config.num_bins
     offset = 1 if (not config.include_background and c > 1) else 0
     out = torch.zeros((3, b, c - offset, k), device=x.device, dtype=torch.float32)
     use_labels = target.dim() == 2
+    act = act_code(config, c)
+    dot = dot and use_labels and act != ACT_NONE
 
     def grid(meta: dict[str, int]) -> tuple[int, int]:
         return (triton.cdiv(n, meta["BLOCK"]), b)
@@ -156,12 +197,15 @@ def hard_stats_fused(
         c,
         b * (c - offset) * k,
         K=k,
-        KP=max(2, triton.next_power_of_2(k)),
+        KP=dot_bins(k) if dot else max(2, triton.next_power_of_2(k)),
         CP=channel_pow2(c),
         OFFSET=offset,
-        ACT=act_code(config, c),
+        ACT=act,
         RIGHT=config.right,
         USE_LABELS=use_labels,
+        DIRECT=direct,
+        DOT=dot,
+        PRECISE=precise,
     )
     count, sum_p, sum_y = out.unbind(0)
     return BinStats(count, sum_p, sum_y, count == 0)

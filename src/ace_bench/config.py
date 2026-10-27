@@ -17,6 +17,9 @@ class ShapeSpec(BaseModel):
     batch: int = Field(ge=1)
     channels: int = Field(ge=1)
     spatial: tuple[int, ...]
+    # input distribution (cases.InputSpec): defaults = Gaussian noise logits
+    logit_scale: float = 2.0
+    target_bias: float = 0.0
 
     @property
     def voxels(self) -> int:

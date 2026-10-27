@@ -1,0 +1,16 @@
+# Sprint 11 dev check: each v6 step vs v5 at one paper shape.
+name: sprint11-dev
+group: sprint11-gaps
+hypothesis: >-
+  The O(1) bin index and the tensor-core reduction shorten the histogram kernel
+  (82% of v5's time); the fused epilogue cuts launches from ~55 to <= 8.
+device: cuda
+impls: [v5_triton, v6_index, v6_dot, v6_triton]
+binnings: [hard, soft]
+modes: [fwd_bwd]
+warmup: 3
+reps: 10
+shapes:
+  - {name: kits23, batch: 2, channels: 4, spatial: [128, 128, 128]}
+  - {name: amos22, batch: 2, channels: 16, spatial: [176, 176, 64]}
+  - {name: cube32, batch: 1, channels: 4, spatial: [32, 32, 32]}

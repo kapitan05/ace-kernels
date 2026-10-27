@@ -18,8 +18,11 @@ assert arch in torch.cuda.get_arch_list(), (
 PY
 
 echo "== Correctness gate (CPU + CUDA)"
-# PYTEST_ARGS narrows the gate for quick dev jobs (default: the whole suite)
-uv run pytest ${PYTEST_ARGS:-tests/} -q -p no:cacheprovider
+# PYTEST_ARGS / PYTEST_K narrow the gate for quick dev jobs (default: whole suite);
+# GATE_CONTINUE=1 (dev jobs only) keeps going after failures to also get timings
+if ! uv run pytest ${PYTEST_ARGS:-tests/} ${PYTEST_K:+-k "$PYTEST_K"} -q -p no:cacheprovider; then
+  if [[ -n "${GATE_CONTINUE:-}" ]]; then echo "== GATE FAILED (continuing: dev job)"; else exit 1; fi
+fi
 
 WANDB=""
 if [[ -n "${WANDB_API_KEY:-}" ]]; then WANDB="--wandb"; fi

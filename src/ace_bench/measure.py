@@ -156,7 +156,14 @@ def compute_reference(
     dtype: str = "float32",
 ) -> Reference | None:
     """The reference's result on the benchmark input (fallback: v2_recompute)."""
-    spec = InputSpec(shape.batch, shape.channels, shape.spatial, seed=seed)
+    spec = InputSpec(
+        shape.batch,
+        shape.channels,
+        shape.spatial,
+        seed=seed,
+        logit_scale=shape.logit_scale,
+        target_bias=shape.target_bias,
+    )
     x, y = make_inputs(spec, loss_config, device)
     x = x.to(getattr(torch, dtype))
     ref: Reference | None = None
@@ -285,7 +292,14 @@ def measure_case(
     dtype: str = "float32",
 ) -> Row:
     device = env.device
-    spec = InputSpec(shape.batch, shape.channels, shape.spatial, seed=seed)
+    spec = InputSpec(
+        shape.batch,
+        shape.channels,
+        shape.spatial,
+        seed=seed,
+        logit_scale=shape.logit_scale,
+        target_bias=shape.target_bias,
+    )
     x, y = make_inputs(spec, loss_config, device)
     x = x.to(getattr(torch, dtype))
     x.requires_grad_(True)  # as in training: fwd also pays for saving tensors

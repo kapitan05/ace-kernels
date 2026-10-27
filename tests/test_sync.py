@@ -10,7 +10,7 @@ import torch
 from ace_kernels import ACEConfig, ace_loss
 from ace_kernels.cases import InputSpec, make_inputs
 from ace_kernels.config import Binning
-from ace_kernels.kernels import HAS_TRITON
+from ace_kernels.kernels import HAS_TRITON, TRITON_IMPLS
 from tests.helpers import skip_unless_supported
 
 pytestmark = [
@@ -20,7 +20,7 @@ pytestmark = [
 
 
 GRAPH_SAFE = ["v1_clean", "v2_recompute", "v2_grad_in_fwd"] + (
-    ["v3_triton", "v4_triton", "v5_triton"] if HAS_TRITON else []
+    sorted(TRITON_IMPLS) if HAS_TRITON else []
 )
 
 

@@ -46,6 +46,8 @@ def _soft_bwd_kernel(
     RIGHT: tl.constexpr,
     ACT: tl.constexpr,
     FROM_LOGITS: tl.constexpr,  # recompute the activation in-kernel (fused)
+    DIRECT: tl.constexpr,  # O(1) bin index, as the forward (bins.sorted_count)
+    PRECISE: tl.constexpr,  # libdevice exp, as the forward
     USE_LABELS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -57,9 +59,9 @@ def _soft_bwd_kernel(
     mask = chan_ok[:, None] & valid[None, :]
     ptrs = b * C * N + chan[:, None] * N + offs[None, :]
     if FROM_LOGITS:  # same functions as the forward kernels -> same bins
-        m, s = softmax_stats(x_ptr, b, offs, valid, N, C, CP)
+        m, s = softmax_stats(x_ptr, b, offs, valid, N, C, CP, PRECISE)
         x = tl.load(x_ptr + ptrs, mask=mask, other=0.0).to(tl.float32)
-        p = tl.where(mask, activate_tl(x, m[None, :], s[None, :], ACT), 0.0)
+        p = tl.where(mask, activate_tl(x, m[None, :], s[None, :], ACT, PRECISE), 0.0)
     else:
         p = tl.load(x_ptr + ptrs, mask=mask, other=0.0).to(tl.float32)  # [CP, BLOCK]
     if USE_LABELS:
@@ -68,7 +70,7 @@ def _soft_bwd_kernel(
     else:
         y = tl.load(onehot_ptr + ptrs, mask=mask, other=0.0).to(tl.float32)
 
-    left, right, lw, rw, span = soft_assign_tl(p, half_ptr, repl_ptr, K, RIGHT)
+    left, right, lw, rw, span = soft_assign_tl(p, half_ptr, repl_ptr, K, RIGHT, DIRECT)
     inv_span = tl.div_rn(1.0, span)
 
     c_loss = C - OFFSET
@@ -105,6 +107,8 @@ def soft_input_grad_triton(
     g: torch.Tensor,
     config: ACEConfig,
     from_logits: bool = False,
+    direct: bool = False,
+    precise: bool = False,
 ) -> torch.Tensor:
     """``dL/d(input)`` [B, C, N] for soft binning.
 
@@ -152,6 +156,8 @@ def soft_input_grad_triton(
         RIGHT=config.right,
         ACT=act,
         FROM_LOGITS=from_logits,
+        DIRECT=direct,
+        PRECISE=precise,
         USE_LABELS=use_labels,
     )
     return dx

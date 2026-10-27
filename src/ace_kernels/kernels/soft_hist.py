@@ -13,6 +13,10 @@ interpolation weights (docs/derivation.md), exactly as ``common.soft_assign``:
 A block's contributions are reduced into private ``[K]`` histograms through the
 ``[BLOCK, K]`` weight matrix ``hit_left * lw + hit_right * rw`` (end bins, where
 left == right, simply add up), then one atomic add per bin and statistic.
+
+Sprint 11 options as in ``hard_hist``: ``DIRECT`` (O(1) half-bin index) and
+``DOT`` (tensor-core reduction: ``onehot_left @ values_left + onehot_right @
+values_right``, values = split weight, weight * p, weight * y).
 """
 
 import torch
@@ -29,6 +33,7 @@ from ace_kernels.kernels.act import (
     channel_pow2,
     softmax_stats,
 )
+from ace_kernels.kernels.bins import DOT_COLS, dot_bins, join3, put3, sorted_count
 
 _CONFIGS = [
     triton.Config({"BLOCK": block}, num_warps=warps)
@@ -38,15 +43,25 @@ _CONFIGS = [
 
 
 @triton.jit
-def soft_assign_tl(p, half_ptr, repl_ptr, K: tl.constexpr, RIGHT: tl.constexpr):
+def soft_assign_tl(
+    p,
+    half_ptr,
+    repl_ptr,
+    K: tl.constexpr,
+    RIGHT: tl.constexpr,
+    DIRECT: tl.constexpr,
+):
     """Left/right bins, weights and span S for probabilities ``p`` (any shape)."""
-    h = tl.zeros(p.shape, dtype=tl.int32)
-    for j in tl.static_range(2 * K):  # half boundaries half[1:], 2K values
-        bound = tl.load(half_ptr + 1 + j)
-        if RIGHT:
-            h += (p >= bound).to(tl.int32)
-        else:
-            h += (p > bound).to(tl.int32)
+    if DIRECT:  # half boundaries half[1:], 2K values, entry j ~= (j + 1) / 2K
+        h = sorted_count(p, half_ptr + 1, 2 * K, RIGHT)
+    else:
+        h = tl.zeros(p.shape, dtype=tl.int32)
+        for j in tl.static_range(2 * K):
+            bound = tl.load(half_ptr + 1 + j)
+            if RIGHT:
+                h += (p >= bound).to(tl.int32)
+            else:
+                h += (p > bound).to(tl.int32)
     left = tl.maximum(h - 1, 0) // 2
     right = tl.minimum(h + 1, 2 * K - 1) // 2
     left_dist = p - tl.load(repl_ptr + h)
@@ -76,6 +91,9 @@ def _soft_hist_kernel(
     ACT: tl.constexpr,
     RIGHT: tl.constexpr,
     USE_LABELS: tl.constexpr,
+    DIRECT: tl.constexpr,
+    DOT: tl.constexpr,
+    PRECISE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     b = tl.program_id(1)  # voxel blocks on axis 0: axis 1 is limited to 65535
@@ -88,25 +106,42 @@ def _soft_hist_kernel(
     m = tl.zeros([BLOCK], dtype=tl.float32)
     s = tl.full([BLOCK], 1.0, dtype=tl.float32)
     if ACT == 1:
-        m, s = softmax_stats(x_ptr, b, offs, valid, N, C, CP)
+        m, s = softmax_stats(x_ptr, b, offs, valid, N, C, CP, PRECISE)
     for c in range(OFFSET, C):
         base = (b * C + c) * N
         x = tl.load(x_ptr + base + offs, mask=valid, other=0.0).to(tl.float32)
-        p = tl.where(valid, activate_tl(x, m, s, ACT), 0.0)
-        left, right, lw, rw, _ = soft_assign_tl(p, half_ptr, repl_ptr, K, RIGHT)
+        p = tl.where(valid, activate_tl(x, m, s, ACT, PRECISE), 0.0)
+        left, right, lw, rw, _ = soft_assign_tl(p, half_ptr, repl_ptr, K, RIGHT, DIRECT)
         lw = tl.where(valid, lw, 0.0)
         rw = tl.where(valid, rw, 0.0)
         if USE_LABELS:
             y = ((label == c) & valid).to(tl.float32)
         else:
             y = tl.load(onehot_ptr + base + offs, mask=valid, other=0.0).to(tl.float32)
-        w = (left[:, None] == bins[None, :]).to(tl.float32) * lw[:, None] + (
-            right[:, None] == bins[None, :]
-        ).to(tl.float32) * rw[:, None]
+        if DOT:
+            col = tl.arange(0, DOT_COLS)[None, :]
+            vl = put3(tl.zeros([BLOCK, DOT_COLS], tl.float32), col, 0, lw)
+            vl = put3(put3(vl, col, 3, lw * p), col, 6, lw * y)
+            vr = put3(tl.zeros([BLOCK, DOT_COLS], tl.float32), col, 0, rw)
+            vr = put3(put3(vr, col, 3, rw * p), col, 6, rw * y)
+            hl = ((bins[:, None] == left[None, :]) & valid[None, :]).to(tl.float16)
+            hr = ((bins[:, None] == right[None, :]) & valid[None, :]).to(tl.float16)
+            acc = tl.dot(hl, vl.to(tl.float16))
+            acc = tl.dot(hr, vr.to(tl.float16), acc)  # [KP, 16]
+            weight = join3(acc, col, 0)
+            sum_p = join3(acc, col, 3)
+            sum_y = join3(acc, col, 6)
+        else:
+            w = (left[:, None] == bins[None, :]).to(tl.float32) * lw[:, None] + (
+                right[:, None] == bins[None, :]
+            ).to(tl.float32) * rw[:, None]
+            weight = tl.sum(w, axis=0)
+            sum_p = tl.sum(w * p[:, None], axis=0)
+            sum_y = tl.sum(w * y[:, None], axis=0)
         out = out_ptr + (b * (C - OFFSET) + c - OFFSET) * K + bins
-        tl.atomic_add(out, tl.sum(w, axis=0), mask=bin_ok)
-        tl.atomic_add(out + BCK, tl.sum(w * p[:, None], axis=0), mask=bin_ok)
-        tl.atomic_add(out + 2 * BCK, tl.sum(w * y[:, None], axis=0), mask=bin_ok)
+        tl.atomic_add(out, weight, mask=bin_ok)
+        tl.atomic_add(out + BCK, sum_p, mask=bin_ok)
+        tl.atomic_add(out + 2 * BCK, sum_y, mask=bin_ok)
 
 
 def soft_tables(
@@ -152,13 +187,21 @@ def soft_stats_triton(prep: Prepared, config: ACEConfig) -> BinStats:
         ACT=ACT_NONE,
         RIGHT=config.right,
         USE_LABELS=use_labels,
+        DIRECT=False,
+        DOT=False,
+        PRECISE=False,
     )
     weight, sum_p, sum_y = out.unbind(0)
     return BinStats(weight, sum_p, sum_y, weight < config.empty_weight)
 
 
 def soft_stats_fused(
-    x: torch.Tensor, target: torch.Tensor, config: ACEConfig
+    x: torch.Tensor,
+    target: torch.Tensor,
+    config: ACEConfig,
+    direct: bool = False,
+    dot: bool = False,
+    precise: bool = False,
 ) -> BinStats:
     """Soft statistics straight from logits ``x`` [B, C, N]; see hard_stats_fused."""
     b, c, n = x.shape
@@ -166,6 +209,8 @@ def soft_stats_fused(
     offset = 1 if (not config.include_background and c > 1) else 0
     out = torch.zeros((3, b, c - offset, k), device=x.device, dtype=torch.float32)
     use_labels = target.dim() == 2
+    act = act_code(config, c)
+    dot = dot and use_labels and act != ACT_NONE
     half, repl = soft_tables(k, x.device)
 
     def grid(meta: dict[str, int]) -> tuple[int, int]:
@@ -182,12 +227,15 @@ def soft_stats_fused(
         c,
         b * (c - offset) * k,
         K=k,
-        KP=max(2, triton.next_power_of_2(k)),
+        KP=dot_bins(k) if dot else max(2, triton.next_power_of_2(k)),
         CP=channel_pow2(c),
         OFFSET=offset,
-        ACT=act_code(config, c),
+        ACT=act,
         RIGHT=config.right,
         USE_LABELS=use_labels,
+        DIRECT=direct,
+        DOT=dot,
+        PRECISE=precise,
     )
     weight, sum_p, sum_y = out.unbind(0)
     return BinStats(weight, sum_p, sum_y, weight < config.empty_weight)

@@ -344,3 +344,158 @@ def test_v5_saves_only_per_bin_tensors(binning: Binning) -> None:
     # a [B, C] temporary from differentiating the class reduction in forward
     expected = 2 * b * c * k * 4 + b * c * 4
     assert expected <= stats.extra_bytes <= expected + 1024
+
+
+# --- Sprint 11: v6 (direct index, tensor-core reduction, fused epilogue) ---
+
+
+def _near_edge_values(table: torch.Tensor, ulps: int = 8) -> torch.Tensor:
+    """Every float32 within ``ulps`` of every table entry, plus 0, 1 and 1e5 uniform."""
+    vals = [table, torch.tensor([0.0, -0.0, 1.0, 2.0, -1.0], device=table.device)]
+    up, down = table.clone(), table.clone()
+    for _ in range(ulps):
+        up = torch.nextafter(up, torch.full_like(up, 2.0))
+        down = torch.nextafter(down, torch.full_like(down, -1.0))
+        vals += [up, down]
+    gen = torch.Generator(device=table.device).manual_seed(0)
+    vals.append(torch.rand(100_000, generator=gen, device=table.device))
+    return torch.cat(vals)
+
+
+@pytest.mark.parametrize("num_bins", [1, 2, 3, 7, 20, 33, 50, 100])
+@pytest.mark.parametrize("right", [False, True])
+@pytest.mark.parametrize("binning", ["hard", "soft"])
+def test_direct_index_exact(num_bins: int, right: bool, binning: Binning) -> None:
+    """O(1) index == the K-compare loop (== torch.bucketize) at every near-edge
+    float32: all statistics bit-identical (same per-voxel arithmetic)."""
+    from ace_kernels.common import hard_edges, soft_half_boundaries
+    from ace_kernels.kernels.hard_hist import hard_stats_fused
+    from ace_kernels.kernels.soft_hist import soft_stats_fused
+
+    table = (
+        hard_edges(num_bins, torch.device("cuda"))
+        if binning == "hard"
+        else soft_half_boundaries(num_bins, torch.device("cuda"))
+    )
+    p = _near_edge_values(table).view(1, 1, -1)
+    config = ACEConfig(binning=binning, num_bins=num_bins, right=right)
+    config = config.model_copy(update={"activation": "none"})
+    target = (torch.arange(p.numel(), device="cuda") % 3 == 0).float().view_as(p)
+    fused = hard_stats_fused if binning == "hard" else soft_stats_fused
+    loop = fused(p, target, config, direct=False)
+    direct = fused(p, target, config, direct=True)
+    for a, b in ((direct.weight, loop.weight), (direct.sum_p, loop.sum_p)):
+        assert torch.equal(a, b)
+    assert torch.equal(direct.sum_gt, loop.sum_gt)
+
+
+@pytest.mark.parametrize("binning", ["hard", "soft"])
+@pytest.mark.parametrize("channels", [2, 4, 16])
+@pytest.mark.parametrize("num_bins", [1, 20, 50])
+@pytest.mark.parametrize("spatial", [(7,), (100003,), (40, 40, 40)])
+def test_dot_reduction_matches_sums(
+    binning: Binning, channels: int, num_bins: int, spatial: tuple[int, ...]
+) -> None:
+    """Tensor-core reduction: counts / target sums exact, p sums as fp32 sums."""
+    from ace_kernels.kernels.act import as_kernel_input
+    from ace_kernels.kernels.hard_hist import hard_stats_fused
+    from ace_kernels.kernels.soft_hist import soft_stats_fused
+
+    config = ACEConfig(binning=binning, num_bins=num_bins, to_onehot_y=True)
+    x, y = make_inputs(InputSpec(2, channels, spatial, seed=5), config, "cuda")
+    xk, yk = as_kernel_input(x), y.reshape(2, -1)
+    fused = hard_stats_fused if binning == "hard" else soft_stats_fused
+    sums = fused(xk, yk, config, direct=True, dot=False)
+    dot = fused(xk, yk, config, direct=True, dot=True)
+    if binning == "hard":
+        assert torch.equal(dot.weight, sums.weight)
+        assert torch.equal(dot.sum_gt, sums.sum_gt)
+    for a, b in ((dot.weight, sums.weight), (dot.sum_gt, sums.sum_gt)):
+        torch.testing.assert_close(a, b, rtol=2e-6, atol=1e-5)
+    torch.testing.assert_close(dot.sum_p, sums.sum_p, rtol=2e-6, atol=1e-5)
+
+
+V6 = ["v6_index", "v6_dot", "v6_triton"]
+
+
+@pytest.mark.parametrize("impl", V6)
+@pytest.mark.parametrize("binning", ["hard", "soft"])
+@pytest.mark.parametrize("name", sorted(BWD_CONFIGS))
+@pytest.mark.parametrize("spatial", [(7,), (33, 17, 5), (64, 64, 64)])
+def test_v6_matches_v5(
+    impl: str, binning: str, name: str, spatial: tuple[int, ...]
+) -> None:
+    """Same bins as v5 (exact index, same exp): loss tight; gradients equal up to
+    fp32 summation order, except rare sign flips of |mean p - mean y| ~ 0 bins."""
+    from ace_kernels import ace_loss
+
+    config = ACEConfig.model_validate({"binning": binning, **BWD_CONFIGS[name]})
+    spec = InputSpec(2, 5, spatial, seed=11, labels_as_index=config.to_onehot_y)
+    x, y = make_inputs(spec, config, "cuda")
+    out = []
+    for name_ in ("v5_triton", impl):
+        leaf = x.clone().requires_grad_(True)
+        loss = ace_loss(leaf, y, config, impl=name_)
+        upstream = torch.linspace(0.5, 2.0, loss.numel(), device="cuda").view_as(loss)
+        out.append((loss.detach(), torch.autograd.grad(loss, leaf, upstream)[0]))
+    torch.testing.assert_close(out[1][0], out[0][0], rtol=1e-5, atol=1e-7)
+    mismatch = ~torch.isclose(out[1][1], out[0][1], rtol=1e-3, atol=1e-7)
+    if impl == "v6_index":  # identical arithmetic
+        assert not mismatch.any()
+    assert mismatch.flatten(2).any(1).float().mean().item() <= 1e-3
+
+
+@pytest.mark.parametrize("binning", ["hard", "soft"])
+def test_v6_launches(binning: Binning) -> None:
+    """Fused epilogue: a handful of launches per fwd + bwd (v5: ~55)."""
+    from torch.profiler import ProfilerActivity, profile
+
+    from ace_kernels import ace_loss
+
+    config = ACEConfig(binning=binning, to_onehot_y=True)
+    x, y = make_inputs(InputSpec(2, 4, (32, 32, 32)), config, "cuda")
+    x.requires_grad_(True)
+    for _ in range(2):  # autotune + compile outside the profile
+        torch.autograd.backward(ace_loss(x, y, config, impl="v6_triton"))
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        torch.autograd.backward(ace_loss(x, y, config, impl="v6_triton"))
+        torch.cuda.synchronize()
+    kernels = [e for e in prof.events() if e.device_type.name == "CUDA"]
+    assert len(kernels) <= 8, [e.name for e in kernels]
+
+
+@pytest.mark.parametrize("binning", ["hard", "soft"])
+def test_v6_compiles_fullgraph(binning: Binning) -> None:
+    """torch.compile of network + loss without graph breaks; same result as eager."""
+    from ace_kernels import ace_loss
+
+    config = ACEConfig(binning=binning, to_onehot_y=True)
+    x, y = make_inputs(InputSpec(2, 4, (16, 16, 16), seed=2), config, "cuda")
+    net = torch.nn.Conv3d(4, 4, 3, padding=1).cuda()
+
+    def step(inp: torch.Tensor) -> torch.Tensor:
+        return ace_loss(net(inp), y, config, impl="v6_triton")
+
+    results = []
+    for fn in (step, torch.compile(step, fullgraph=True)):
+        net.zero_grad()
+        loss = fn(x)
+        torch.autograd.backward(loss)
+        assert net.weight.grad is not None
+        results.append((loss.detach(), net.weight.grad.clone()))
+    torch.testing.assert_close(results[1][0], results[0][0], rtol=1e-5, atol=1e-7)
+    torch.testing.assert_close(results[1][1], results[0][1], rtol=1e-3, atol=1e-6)
+
+
+@pytest.mark.parametrize("binning", ["hard", "soft"])
+def test_v6_precise_exp_matches_torch_softmax(binning: Binning) -> None:
+    """libdevice exp: in-kernel probabilities bin like torch.softmax (v4) far more
+    often than the fast exp; measured, not required equal."""
+    from ace_kernels.impls.v6_triton import Options, _forward
+
+    config = ACEConfig(binning=binning, to_onehot_y=True)
+    x, y = make_inputs(InputSpec(2, 4, (64, 64, 64), seed=3), config, "cuda")
+    ref = _forward(x, y, config, Options(direct=True, precise=False))
+    precise = _forward(x, y, config, Options(direct=True, precise=True))
+    torch.testing.assert_close(precise[0], ref[0], rtol=1e-5, atol=1e-7)

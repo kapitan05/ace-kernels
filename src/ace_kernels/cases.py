@@ -27,6 +27,9 @@ class InputSpec:
         True  -> target is ``[B, 1, *spatial]`` class indices (for ``to_onehot_y``).
         False -> target is one-hot ``[B, C, *spatial]`` float.
     missing_classes: class indices that never appear in the target.
+    target_bias: added to the true class's logit (``kind="logits"``, C > 1):
+        with a large ``logit_scale`` this mimics a trained network (peaked,
+        mostly correct softmax) instead of noise.
     """
 
     batch: int
@@ -38,6 +41,7 @@ class InputSpec:
     constant_value: float = 0.5
     labels_as_index: bool = True
     missing_classes: tuple[int, ...] = field(default_factory=tuple)
+    target_bias: float = 0.0
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -83,6 +87,10 @@ def make_inputs(
         target = labels
     else:
         target = torch.zeros(spec.shape).scatter_(1, labels, 1.0)
+    if spec.target_bias and spec.kind == "logits" and spec.channels > 1:
+        x.scatter_add_(
+            1, labels, torch.full(labels.shape, spec.target_bias, dtype=x.dtype)
+        )
     return x.to(device), target.to(device)
 
 

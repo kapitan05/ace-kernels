@@ -40,6 +40,9 @@ LADDER = [
     ("v3_triton", "S5", "Triton private-histogram forward"),
     ("v4_triton", "S6/S7", "+ Triton backward"),
     ("v5_triton", "S8", "+ softmax fused into both kernels"),
+    ("v6_index", "S11", "+ O(1) bin index"),
+    ("v6_dot", "S11", "+ tensor-core histogram reduction"),
+    ("v6_triton", "S11", "+ one-launch epilogue, torch.library op"),
 ]
 PAPER_SHAPES = ["kits23", "acdc17", "brats21", "amos22"]
 MiB = 2**20

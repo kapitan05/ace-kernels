@@ -9,6 +9,7 @@ the reference only for probabilities within ~1e-7 of a bin edge.
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 from ace_kernels.config import ACEConfig
 
@@ -25,7 +26,17 @@ def act_code(config: ACEConfig, channels: int) -> int:
 
 
 @triton.jit
-def softmax_stats(x_ptr, b, offs, valid, N, C, CP: tl.constexpr):
+def exp_tl(x, PRECISE: tl.constexpr):
+    """``tl.exp`` (fast approximate ex2) or libdevice ``expf`` (as CUDA PyTorch)."""
+    if PRECISE:  # noqa: SIM108 (constexpr branch in a Triton function)
+        y = libdevice.exp(x)
+    else:
+        y = tl.exp(x)
+    return y
+
+
+@triton.jit
+def softmax_stats(x_ptr, b, offs, valid, N, C, CP: tl.constexpr, PRECISE: tl.constexpr):
     """Per-voxel max and sum of exp over the C channels of a block: [BLOCK] each."""
     chan = tl.arange(0, CP)
     mask = (chan < C)[:, None] & valid[None, :]
@@ -35,17 +46,17 @@ def softmax_stats(x_ptr, b, offs, valid, N, C, CP: tl.constexpr):
         other=float("-inf"),
     ).to(tl.float32)
     m = tl.where(valid, tl.max(x, axis=0), 0.0)
-    s = tl.sum(tl.exp(x - m[None, :]), axis=0)  # masked rows: exp(-inf) = 0
+    s = tl.sum(exp_tl(x - m[None, :], PRECISE), axis=0)  # masked rows: exp(-inf) = 0
     return m, tl.where(valid, s, 1.0)
 
 
 @triton.jit
-def activate_tl(x, m, s, ACT: tl.constexpr):
+def activate_tl(x, m, s, ACT: tl.constexpr, PRECISE: tl.constexpr):
     """Probability from logits ``x`` (``m``, ``s`` from ``softmax_stats``)."""
     if ACT == 1:
-        p = tl.div_rn(tl.exp(x - m), s)
+        p = tl.div_rn(exp_tl(x - m, PRECISE), s)
     elif ACT == 2:
-        p = tl.div_rn(1.0, 1.0 + tl.exp(-x))
+        p = tl.div_rn(1.0, 1.0 + exp_tl(-x, PRECISE))
     else:
         p = x
     return p
