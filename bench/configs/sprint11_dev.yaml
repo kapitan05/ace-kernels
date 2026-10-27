@@ -5,7 +5,7 @@ hypothesis: >-
   The O(1) bin index and the tensor-core reduction shorten the histogram kernel
   (82% of v5's time); the fused epilogue cuts launches from ~55 to <= 8.
 device: cuda
-impls: [v5_triton, v6_index, v6_dot, v6_triton]
+impls: [v5_triton, v6_index, v6_triton, v6_precise]
 binnings: [hard, soft]
 modes: [fwd_bwd]
 warmup: 3
