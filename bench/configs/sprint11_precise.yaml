@@ -1,0 +1,19 @@
+# Sprint 11.4: precise (libdevice) exp in the kernels vs Triton's fast exp.
+name: sprint11-precise
+group: sprint11-gaps
+hypothesis: >-
+  Triton's fast exp moves near-edge voxels to the neighbouring bin compared with
+  torch.softmax (L2 gradient error 2.9e-4 vs the reference's 6.2e-5 at brats21
+  hard). libdevice exp brings the L2 error back to the reference's level for <= 5%
+  more time.
+device: cuda
+impls: [reference, v5_triton, v6_triton, v6_precise]
+binnings: [hard, soft]
+modes: [fwd_bwd]
+warmup: 3
+reps: 10
+shapes:
+  - {name: kits23, batch: 2, channels: 4, spatial: [128, 128, 128]}
+  - {name: brats21, batch: 2, channels: 4, spatial: [224, 224, 144]}
+  - {name: amos22, batch: 2, channels: 16, spatial: [176, 176, 64]}
+  - {name: kits23-trained, batch: 2, channels: 4, spatial: [128, 128, 128], logit_scale: 3.0, target_bias: 8.0}

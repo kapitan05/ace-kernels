@@ -4,6 +4,8 @@
 - ``v6_triton``: + one-launch epilogue (``kernels/epilogue.py``) instead of ~50 small
   PyTorch ops, registered as ``torch.library`` custom ops so ``torch.compile`` of a
   whole training step treats the loss as two opaque nodes (no graph break).
+- ``v6_precise``: v6_triton with libdevice ``exp`` instead of Triton's fast one
+  (accuracy vs speed; autograd.Function, not the custom op).
 - ``v6_dot``:    side branch, v6_index + tensor-core histogram reduction
   (``kernels/bins.put3``): 3.6-4x slower on a T4 (no tensor-core ``tl.dot`` on
   sm_75); kept to re-measure on sm_80+ GPUs.
@@ -223,6 +225,11 @@ if HAS_TRITON:
         description="v5 + O(1) bin index (floor + exact correction)",
         devices=_CUDA,
     )(_entry(Options(direct=True)))
+    register(
+        "v6_precise",
+        description="v6_triton with libdevice exp (as torch.softmax) in the kernels",
+        devices=_CUDA,
+    )(_entry(Options(direct=True, epilogue=True, precise=True)))
     register(
         "v6_dot",
         description="v6_index + tensor-core histogram reduction (side branch)",
