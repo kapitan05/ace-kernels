@@ -15,10 +15,9 @@ import torch
 import triton
 import triton.language as tl
 
-from ace_kernels.common import hard_edges
 from ace_kernels.config import ACEConfig
 from ace_kernels.kernels.act import activate_tl, softmax_stats
-from ace_kernels.kernels.bins import sorted_count
+from ace_kernels.kernels.bins import edge_table, sorted_count
 
 ACT_NONE, ACT_SOFTMAX, ACT_SIGMOID = 0, 1, 2
 
@@ -134,7 +133,7 @@ def hard_input_grad_triton(
         probs,
         coef.contiguous().float(),
         g.contiguous().float(),
-        hard_edges(k, probs.device).contiguous(),
+        edge_table(k, probs.device),
         dx,
         n,
         c,

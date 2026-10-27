@@ -11,8 +11,13 @@ exact in fp16, and each fp32 value is split into three fp16 parts, so the fp16
 tensor-core products (fp32 accumulation) reproduce the fp32 sums.
 """
 
+import functools
+
+import torch
 import triton
 import triton.language as tl
+
+from ace_kernels.common import hard_edges
 
 DOT_COLS = tl.constexpr(16)  # value columns of the reduction matmul
 # split scales 2^11 (fp16 significand bits) and 2^22 appear as literals below:
@@ -82,3 +87,22 @@ def join3(acc, col, j: tl.constexpr):
 def dot_bins(k: int) -> int:
     """Bin tile of the matmul path: power of two, >= 16 (tl.dot minimum)."""
     return max(16, int(triton.next_power_of_2(k)))
+
+
+@functools.lru_cache(maxsize=64)
+def edge_table(num_bins: int, device: torch.device) -> torch.Tensor:
+    """``hard_edges``, built once per device: no linspace launch per call."""
+    return hard_edges(num_bins, device).contiguous()
+
+
+def prune_dot_configs(
+    configs: list[triton.Config], named_args: dict[str, object], **kwargs: object
+) -> list[triton.Config]:
+    """Matmul path: drop tiles whose one-hot operand exceeds shared memory (T4:
+    64 KiB; measured: BLOCK 512 x 64 bins needs 128 KiB)."""
+    meta = {**named_args, **kwargs}
+    if not meta.get("DOT"):
+        return configs
+    bins = int(str(meta["KP"]))
+    fits = [c for c in configs if c.kwargs["BLOCK"] * bins <= 8192]
+    return fits or configs[:1]

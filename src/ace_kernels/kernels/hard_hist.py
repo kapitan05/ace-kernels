@@ -22,7 +22,7 @@ import triton
 import triton.language as tl
 
 from ace_kernels.binning import BinStats
-from ace_kernels.common import Prepared, hard_edges
+from ace_kernels.common import Prepared
 from ace_kernels.config import ACEConfig
 from ace_kernels.kernels.act import (
     ACT_NONE,
@@ -35,7 +35,9 @@ from ace_kernels.kernels.bins import (
     DOT_COLS,
     column,
     dot_bins,
+    edge_table,
     join3,
+    prune_dot_configs,
     put3,
     sorted_count,
 )
@@ -47,7 +49,12 @@ _CONFIGS = [
 ]
 
 
-@triton.autotune(configs=_CONFIGS, key=["N", "C", "K"], reset_to_zero=["out_ptr"])
+@triton.autotune(
+    configs=_CONFIGS,
+    key=["N", "C", "K", "DOT"],
+    reset_to_zero=["out_ptr"],
+    prune_configs_by={"early_config_prune": prune_dot_configs},
+)
 @triton.jit
 def _hard_hist_kernel(
     x_ptr,  # [B, C, N] probabilities (ACT none) or logits, any float dtype
@@ -132,7 +139,7 @@ def hard_stats_triton(prep: Prepared, config: ACEConfig) -> BinStats:
     use_labels = prep.labels is not None
     labels = prep.labels.contiguous() if prep.labels is not None else p
     onehot = p if prep.onehot is None else prep.onehot.contiguous().float()
-    edges = hard_edges(k, p.device).contiguous()
+    edges = edge_table(k, p.device)
 
     def grid(meta: dict[str, int]) -> tuple[int, int]:
         return (triton.cdiv(n, meta["BLOCK"]), b)
@@ -169,7 +176,23 @@ def hard_stats_fused(
     dot: bool = False,
     precise: bool = False,
 ) -> BinStats:
-    """Hard statistics straight from logits ``x`` [B, C, N] (activation in-kernel).
+    """``hard_hist_fused`` as ``BinStats`` (count, sum p, sum y, empty)."""
+    count, sum_p, sum_y = hard_hist_fused(
+        x, target, config, direct, dot, precise
+    ).unbind(0)
+    return BinStats(count, sum_p, sum_y, count == 0)
+
+
+def hard_hist_fused(
+    x: torch.Tensor,
+    target: torch.Tensor,
+    config: ACEConfig,
+    direct: bool = False,
+    dot: bool = False,
+    precise: bool = False,
+) -> torch.Tensor:
+    """``[3, B, C', K]`` count, sum p, sum y straight from logits ``x`` [B, C, N]
+    (activation in-kernel).
 
     ``target``: ``[B, N]`` class indices (original numbering) when ``to_onehot_y``
     and C > 1, else ``[B, C, N]`` targets. Covers the loss channels (C - 1 when the
@@ -191,7 +214,7 @@ def hard_stats_fused(
         x,
         target if use_labels else x,
         x if use_labels else target,
-        hard_edges(k, x.device).contiguous(),
+        edge_table(k, x.device),
         out,
         n,
         c,
@@ -207,5 +230,4 @@ def hard_stats_fused(
         DOT=dot,
         PRECISE=precise,
     )
-    count, sum_p, sum_y = out.unbind(0)
-    return BinStats(count, sum_p, sum_y, count == 0)
+    return out

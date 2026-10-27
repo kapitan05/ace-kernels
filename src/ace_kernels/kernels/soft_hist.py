@@ -19,6 +19,8 @@ Sprint 11 options as in ``hard_hist``: ``DIRECT`` (O(1) half-bin index) and
 values_right``, values = split weight, weight * p, weight * y).
 """
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
@@ -33,7 +35,14 @@ from ace_kernels.kernels.act import (
     channel_pow2,
     softmax_stats,
 )
-from ace_kernels.kernels.bins import DOT_COLS, dot_bins, join3, put3, sorted_count
+from ace_kernels.kernels.bins import (
+    DOT_COLS,
+    dot_bins,
+    join3,
+    prune_dot_configs,
+    put3,
+    sorted_count,
+)
 
 _CONFIGS = [
     triton.Config({"BLOCK": block}, num_warps=warps)
@@ -72,7 +81,12 @@ def soft_assign_tl(
     return left, right, lw, rw, span
 
 
-@triton.autotune(configs=_CONFIGS, key=["N", "C", "K"], reset_to_zero=["out_ptr"])
+@triton.autotune(
+    configs=_CONFIGS,
+    key=["N", "C", "K", "DOT"],
+    reset_to_zero=["out_ptr"],
+    prune_configs_by={"early_config_prune": prune_dot_configs},
+)
 @triton.jit
 def _soft_hist_kernel(
     x_ptr,  # [B, C, N] probabilities (ACT none) or logits, any float dtype
@@ -144,10 +158,12 @@ def _soft_hist_kernel(
         tl.atomic_add(out + 2 * BCK, sum_y, mask=bin_ok)
 
 
+@functools.lru_cache(maxsize=64)
 def soft_tables(
     num_bins: int, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Half boundaries and the replicated-centres table, as in the reference."""
+    """Half boundaries and the replicated-centres table, as in the reference.
+    Built once per (bins, device): no linspace / cat launches per call."""
     half = soft_half_boundaries(num_bins, device).contiguous()
     sentinel = half.new_full((1,), 10000.0)
     repl = torch.cat((-sentinel, half[1::2].repeat_interleave(2), sentinel))
@@ -203,7 +219,22 @@ def soft_stats_fused(
     dot: bool = False,
     precise: bool = False,
 ) -> BinStats:
-    """Soft statistics straight from logits ``x`` [B, C, N]; see hard_stats_fused."""
+    """``soft_hist_fused`` as ``BinStats`` (weight, sum p, sum y, empty)."""
+    weight, sum_p, sum_y = soft_hist_fused(
+        x, target, config, direct, dot, precise
+    ).unbind(0)
+    return BinStats(weight, sum_p, sum_y, weight < config.empty_weight)
+
+
+def soft_hist_fused(
+    x: torch.Tensor,
+    target: torch.Tensor,
+    config: ACEConfig,
+    direct: bool = False,
+    dot: bool = False,
+    precise: bool = False,
+) -> torch.Tensor:
+    """``[3, B, C', K]`` soft statistics straight from logits; see hard_hist_fused."""
     b, c, n = x.shape
     k = config.num_bins
     offset = 1 if (not config.include_background and c > 1) else 0
@@ -237,5 +268,4 @@ def soft_stats_fused(
         DOT=dot,
         PRECISE=precise,
     )
-    weight, sum_p, sum_y = out.unbind(0)
-    return BinStats(weight, sum_p, sum_y, weight < config.empty_weight)
+    return out

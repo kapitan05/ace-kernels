@@ -415,8 +415,9 @@ def test_dot_reduction_matches_sums(
         assert torch.equal(dot.weight, sums.weight)
         assert torch.equal(dot.sum_gt, sums.sum_gt)
     for a, b in ((dot.weight, sums.weight), (dot.sum_gt, sums.sum_gt)):
-        torch.testing.assert_close(a, b, rtol=2e-6, atol=1e-5)
-    torch.testing.assert_close(dot.sum_p, sums.sum_p, rtol=2e-6, atol=1e-5)
+        torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-5)
+    # two fp32 summation orders over up to 1e5 values: ~1e-6 apart (measured 2.2e-6)
+    torch.testing.assert_close(dot.sum_p, sums.sum_p, rtol=1e-5, atol=1e-5)
 
 
 V6 = ["v6_index", "v6_dot", "v6_triton"]

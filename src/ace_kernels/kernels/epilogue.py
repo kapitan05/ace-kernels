@@ -16,7 +16,6 @@ import torch
 import triton
 import triton.language as tl
 
-from ace_kernels.binning import BinStats
 from ace_kernels.common import class_weights
 from ace_kernels.config import ACEConfig
 
@@ -92,21 +91,23 @@ def _class_weight_tensor(
 
 
 def epilogue_triton(
-    stats: BinStats, config: ACEConfig, spatial_ndim: int
+    hist: torch.Tensor, config: ACEConfig, spatial_ndim: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """(loss, coef, d, jac) from ``[B, C', K]`` statistics, as v5's PyTorch path."""
-    b, cl, k = stats.weight.shape
+    """(loss, coef, d, jac) from the kernels' ``[3, B, C', K]`` statistics (weight,
+    sum p, sum y), as v5's PyTorch path."""
+    weight, sum_p, sum_y = hist.unbind(0)
+    _, b, cl, k = hist.shape
     rows = b * cl
     weights = class_weights(config, cl) or [1.0] * cl
-    coef = torch.empty_like(stats.weight)
-    d = torch.empty_like(stats.weight)
+    coef = torch.empty_like(weight)
+    d = torch.empty_like(weight)
     jac = torch.empty((b, cl), device=coef.device, dtype=torch.float32)
     f = torch.empty_like(jac)
     loss = torch.empty((), device=coef.device, dtype=torch.float32)
     _epilogue_kernel[(1,)](
-        stats.weight.contiguous(),
-        stats.sum_p.contiguous(),
-        stats.sum_gt.contiguous(),
+        weight,
+        sum_p,
+        sum_y,
         _class_weight_tensor(tuple(weights), coef.device),
         coef,
         d,

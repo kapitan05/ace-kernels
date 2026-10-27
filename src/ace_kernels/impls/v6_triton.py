@@ -1,10 +1,12 @@
 """v6 (Sprint 11): closing the gaps of v5, one registry entry per change.
 
 - ``v6_index``:  v5 + O(1) bin index in all kernels (``kernels/bins.sorted_count``).
-- ``v6_dot``:    + tensor-core histogram reduction (``kernels/bins.put3``).
 - ``v6_triton``: + one-launch epilogue (``kernels/epilogue.py``) instead of ~50 small
   PyTorch ops, registered as ``torch.library`` custom ops so ``torch.compile`` of a
   whole training step treats the loss as two opaque nodes (no graph break).
+- ``v6_dot``:    side branch, v6_index + tensor-core histogram reduction
+  (``kernels/bins.put3``): 3.6-4x slower on a T4 (no tensor-core ``tl.dot`` on
+  sm_75); kept to re-measure on sm_80+ GPUs.
 
 Like v5: logits in (fp32/bf16/fp16), d logits out; saves the inputs and per-bin
 ``[B, C, K]`` tensors only.
@@ -41,16 +43,19 @@ def _forward(
     """(loss, coef, d, jac) for logits ``input``."""
     from ace_kernels.kernels.act import as_kernel_input
     from ace_kernels.kernels.epilogue import epilogue_triton
-    from ace_kernels.kernels.hard_hist import hard_stats_fused
-    from ace_kernels.kernels.soft_hist import soft_stats_fused
+    from ace_kernels.kernels.hard_hist import hard_hist_fused, hard_stats_fused
+    from ace_kernels.kernels.soft_hist import soft_hist_fused, soft_stats_fused
 
     x = as_kernel_input(input)
     tgt = _kernel_target(target, config, x.shape[1])
-    fused = hard_stats_fused if config.binning == "hard" else soft_stats_fused
-    stats = fused(x, tgt, config, opt.direct, opt.dot, opt.precise)
+    args = (x, tgt, config, opt.direct, opt.dot, opt.precise)
+    hard = config.binning == "hard"
     if opt.epilogue:
-        return epilogue_triton(stats, config, input.dim() - 2)
-    f, present, coef, d = coefficients(stats)
+        hist = hard_hist_fused(*args) if hard else soft_hist_fused(*args)
+        return epilogue_triton(hist, config, input.dim() - 2)
+    f, present, coef, d = coefficients(
+        hard_stats_fused(*args) if hard else soft_stats_fused(*args)
+    )
     shape_only = Prepared(x, None, None, input.dim() - 2)
     loss = reduce_classes(f, shape_only, config, present)
     jac = _reduction_jacobian(f, shape_only, config, present)
@@ -103,7 +108,9 @@ class _V6Loss(torch.autograd.Function):
         return dx, None, None, None
 
 
-FULL = Options(direct=True, dot=True, epilogue=True)
+# v6_triton: no tensor-core reduction. Measured on a T4 (sm_75, no Triton
+# tensor-core path): v6_dot 3.6-4x *slower* than v6_index. To re-test on sm_80+.
+FULL = Options(direct=True, epilogue=True)
 
 
 @functools.lru_cache(maxsize=64)
@@ -179,6 +186,7 @@ def _setup_context(ctx: Any, inputs: tuple[Any, ...], output: Outputs) -> None:
     input, target, config_json = inputs
     _, coef, d, jac = output
     ctx.config_json = config_json
+    ctx.set_materialize_grads(False)  # coef / d / jac get no gradient: no zero fills
     ctx.save_for_backward(input, target, coef, d, jac)
 
 
@@ -217,11 +225,11 @@ if HAS_TRITON:
     )(_entry(Options(direct=True)))
     register(
         "v6_dot",
-        description="v6_index + tensor-core histogram reduction",
+        description="v6_index + tensor-core histogram reduction (side branch)",
         devices=_CUDA,
     )(_entry(Options(direct=True, dot=True)))
     register(
         "v6_triton",
-        description="v6_dot + one-launch epilogue, as torch.library custom ops",
+        description="v6_index + one-launch epilogue, as torch.library custom ops",
         devices=_CUDA,
     )(_entry(None))
