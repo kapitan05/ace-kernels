@@ -1,45 +1,57 @@
 # Report
 
-## Summary (Tesla T4, 2026-10-27)
+## Summary (Tesla T4, 2026-10-27, after Sprint 11)
 
 **Goal.** Make the mL1-ACE calibration loss (cai4cai/Average-Calibration-Losses, arXiv 2506.03942)
 fast and memory-lean on the GPU without changing what it computes.
 
-**Result** (forward + backward, paper training shapes, batch 2; `v5_triton`, Triton
-kernels with fused softmax; full table: `docs/ablation/ablation.md`):
+**Use it** (drop-in, same constructor as upstream):
+`from ace_kernels.module import HardL1ACELoss, SoftL1ACELoss` — Triton on CUDA
+(`v6_precise`), handwritten-backward PyTorch elsewhere.
 
-| | original | best PyTorch (`torch.compile`) | **v5_triton** |
+**Result** (forward + backward, paper training shapes, batch 2; `v6_precise`,
+Sprint 11; full table: `docs/ablation/ablation.md`):
+
+| | original | best PyTorch (`torch.compile`) | **ours (v6)** |
 |---|---|---|---|
-| hard, kits23 (4 x 128^3) | 99.5 ms, 320 MiB | 19.3 ms | **3.6 ms (28x), 64 MiB** |
-| soft, kits23 | 184 ms, 864 MiB | 39.2 ms | **6.3 ms (29x), 64 MiB** |
-| soft, brats21 (4 x 224^2 x 144) | 608 ms, 3.0 GiB | 136 ms | **20.8 ms (29x), 221 MiB** |
-| soft, amos22 (16 x 176^2 x 64) | 1492 ms, 3.4 GiB | 334 ms | **22.5 ms (66x), 242 MiB** |
-| % of peak DRAM bandwidth | 0.2-0.8% | 1-4% | 13-23% |
+| hard, kits23 (4 x 128^3) | 99.5 ms, 320 MiB | 19.3 ms | **3.4 ms (29x), 64 MiB** |
+| soft, kits23 | 182 ms, 864 MiB | 39.2 ms | **5.3 ms (34x), 64 MiB** |
+| soft, brats21 (4 x 224^2 x 144) | 606 ms, 3.0 GiB | 136 ms | **18.7 ms (32x), 221 MiB** |
+| soft, amos22 (16 x 176^2 x 64) | 1492 ms, 3.4 GiB | 334 ms | **19.9 ms (75x), 242 MiB** |
+| deep supervision, 4 levels / step (soft) | 118 ms | | **2.8 ms (42x)** |
+| % of peak DRAM bandwidth | 0.2-0.8% | 1-4% | 13-28% |
+| kernel launches per call | 428-3813 | | 7 |
 
 - **Correct.** Same loss and gradients as the original: 43 golden cases, random
-  shapes, float64 oracle, gradcheck of the handwritten backward, and every benchmark
-  row checked at full size against the original and a float64 truth. The loss is
-  10-400x *closer* to the exact value than the original's (block-wise sums).
+  shapes, float64 oracle, gradcheck of the handwritten backward, the drop-in module
+  against the upstream classes, and every benchmark row checked at full size
+  against the original and a float64 truth. Our loss is *closer* to the exact value
+  than the original's: 10-400x on noise inputs, and on trained-network-like inputs
+  the original is 2e-3 off (fp32 accumulation into one dominant bin), ours 1e-7..6e-6.
 - **Why the original was slow.** Not the Python loop: 84% of its GPU time was atomic
-  contention (millions of voxels adding into 20 bin addresses). Fix: per-block
-  private histograms (one atomic per bin per block), a handwritten backward that
-  stores only per-bin values, and fusion (softmax, binning, reduction, backward).
+  contention (millions of voxels adding into 20 bin addresses), worse on realistic
+  (peaked) inputs. Fix: per-block private histograms (one atomic per bin per block),
+  a handwritten backward that stores only per-bin values, fusion (softmax, binning,
+  epilogue, backward) and an O(1) bin index.
 - **Memory.** Nothing voxel-sized is kept for backward (the original keeps 3x / 11x
   the input for hard / soft); peak = one input-sized tensor. The original runs out
-  of memory at 288^3 (soft); v5 needs 1.46 GiB there.
-- **In training** (paper network SegResNetDS, AMP): step 1.12x (hard) / 1.27x (soft)
-  faster at 128^3 (the network dominates the step), hard-binning patches up to 224^3
-  fit where the original stops at 208^3, and loss curves stay within the original's
-  own run-to-run variation.
-- **Findings along the way** (details in the sprint sections): the off-the-shelf
+  of memory at 288^3 (soft); ours needs 1.46 GiB there.
+- **In training** (paper network SegResNetDS, AMP, 128^3): step 1.10x (hard) / 1.23x
+  (soft) faster eager, 1.24x / 1.38x with `torch.compile` (the loss adds no graph
+  breaks; the network dominates the step); hard-binning patches up to 224^3 fit
+  where the original stops at 208^3; loss curves within the original's own
+  run-to-run variation.
+- **Findings along the way** (details in the sprint sections): off-the-shelf
   `torch.compile` gives at most 5x and is 2x *slower* for soft at 16 classes;
   `torch.utils.checkpoint` saves memory but not peak memory and costs 1.6x time;
   max-norm gradient errors are not meaningful for this loss (|x| kink at
-  mean_p ~ mean_y), relative L2 errors are.
-- **Limits / next.** 4-6x above the bandwidth floor: 80% of v5's time is the
-  histogram kernel (compute-bound compare-and-reduce). Full paper replication
-  (calibration metrics, reliability diagrams, seeds) planned on the RTX PRO 6000.
-  Kaggle T4 has no `ncu` (hardware counters blocked).
+  mean_p ~ mean_y), relative L2 errors are; Triton's fast exp moves near-edge voxels
+  (fixed: libdevice exp, +0-6%); a tensor-core histogram reduction is 4-8x *slower*
+  on a T4 (sm_75, no Triton tensor-core path).
+- **Limits / next.** 3.5-7x above the bandwidth floor: 83-86% of the time is the
+  histogram kernel's per-block reduction. Re-measure on the RTX PRO 6000 (incl. the
+  tensor-core variant), then the full paper replication (calibration metrics,
+  reliability diagrams, seeds). Kaggle T4 has no `ncu` (hardware counters blocked).
 
 **How to read this repo.** Sprints are tagged (`git diff sprint-N sprint-M`); each
 section below has done / results / findings; raw runs in `results/kaggle/<commit>-*`,
@@ -606,7 +618,7 @@ of v6's GPU time).
 | | reference | v5 | v5 + CUDA graph | **v6_triton** |
 |---|---|---|---|---|
 | hard | 62.1 ms | 4.47 ms | 2.51 ms | **1.91 ms (33x)** |
-| soft | 118.5 ms | 5.78 ms | 4.05 ms | **2.82 ms (42x)** |
+| soft | 118.5 ms | 5.78 ms | 3.80 ms | **2.82 ms (42x)** |
 
 v6 needs no CUDA graph (graph rows identical); v5 needed one at small sizes.
 
