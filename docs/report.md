@@ -1,5 +1,51 @@
 # Report
 
+## Summary (Tesla T4, 2026-10-27)
+
+**Goal.** Make the mL1-ACE calibration loss (Barfoot et al., cai4cai/Average-Calibration-Losses)
+fast and memory-lean on the GPU without changing what it computes.
+
+**Result** (forward + backward, paper training shapes, batch 2; `v5_triton`, Triton
+kernels with fused softmax; full table: `docs/ablation/ablation.md`):
+
+| | original | best PyTorch (`torch.compile`) | **v5_triton** |
+|---|---|---|---|
+| hard, kits23 (4 x 128^3) | 99.5 ms, 320 MiB | 19.3 ms | **3.6 ms (28x), 64 MiB** |
+| soft, kits23 | 184 ms, 864 MiB | 39.2 ms | **6.3 ms (29x), 64 MiB** |
+| soft, brats21 (4 x 224^2 x 144) | 608 ms, 3.0 GiB | 136 ms | **20.8 ms (29x), 221 MiB** |
+| soft, amos22 (16 x 176^2 x 64) | 1492 ms, 3.4 GiB | 334 ms | **22.5 ms (66x), 242 MiB** |
+| % of peak DRAM bandwidth | 0.2-0.8% | 1-4% | 13-23% |
+
+- **Correct.** Same loss and gradients as the original: 43 golden cases, random
+  shapes, float64 oracle, gradcheck of the handwritten backward, and every benchmark
+  row checked at full size against the original and a float64 truth. The loss is
+  10-400x *closer* to the exact value than the original's (block-wise sums).
+- **Why the original was slow.** Not the Python loop: 84% of its GPU time was atomic
+  contention (millions of voxels adding into 20 bin addresses). Fix: per-block
+  private histograms (one atomic per bin per block), a handwritten backward that
+  stores only per-bin values, and fusion (softmax, binning, reduction, backward).
+- **Memory.** Nothing voxel-sized is kept for backward (the original keeps 3x / 11x
+  the input for hard / soft); peak = one input-sized tensor. The original runs out
+  of memory at 288^3 (soft); v5 needs 1.46 GiB there.
+- **In training** (paper network SegResNetDS, AMP): step 1.12x (hard) / 1.27x (soft)
+  faster at 128^3 (the network dominates the step), hard-binning patches up to 224^3
+  fit where the original stops at 208^3, and loss curves stay within the original's
+  own run-to-run variation.
+- **Findings along the way** (details in the sprint sections): the off-the-shelf
+  `torch.compile` gives at most 5x and is 2x *slower* for soft at 16 classes;
+  `torch.utils.checkpoint` saves memory but not peak memory and costs 1.6x time;
+  max-norm gradient errors are not meaningful for this loss (|x| kink at
+  mean_p ~ mean_y), relative L2 errors are.
+- **Limits / next.** 4-6x above the bandwidth floor: 80% of v5's time is the
+  histogram kernel (compute-bound compare-and-reduce). Full paper replication
+  (calibration metrics, reliability diagrams, seeds) planned on the RTX PRO 6000.
+  Kaggle T4 has no `ncu` (hardware counters blocked).
+
+**How to read this repo.** Sprints are tagged (`git diff sprint-N sprint-M`); each
+section below has done / results / findings; raw runs in `results/kaggle/<commit>-*`,
+mirrored to W&B project `ace-kernels`.
+
+
 ## Sprint 1: Project skeleton + correctness harness (2026-10-23)
 
 **Done**
