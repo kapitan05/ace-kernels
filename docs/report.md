@@ -497,5 +497,23 @@ fwd+bwd p50 ms (speedup vs reference); peak MiB, fp32 logits:
   near the limit the loss's memory matters: hard, the reference OOMs at 224^3 where
   v4/v5 fit (soft: all fit 224^3, all OOM 256^3).
 - Loss curves overlap visually; max step-wise difference vs reference 1.5% (hard) /
-  6.4% (soft). **Not yet attributable**: a reference-vs-reference control run
-  (cuDNN, atomics and AMP are nondeterministic) is running (`8f63165`).
+  6.4% (soft); resolved by the control run below.
+
+**Control run** (`results/kaggle/8f631653e11c-run-e2e/`, reference trained twice):
+
+| binning | reference vs itself (max / mean) | v5_triton | v4_triton |
+|---|---|---|---|
+| hard | 2e-7 / 4e-8 (deterministic here) | 1.2% / 0.3% | 1.5% / 0.3% |
+| soft | 5.7% / 2.1% (noise floor) | 4.4% / 1.4% | 9.8% / 5.6% |
+
+- Step 0 (same weights, same batch) is identical for all runs (loss 1.46010, ACE
+  term 0.853118, differences 8e-8): the forward pass is exact. Step 1 differs by
+  ~1e-5 (fp-level gradient differences: summation order, ill-conditioned bins), and
+  training amplifies them chaotically; each run then keeps its own trajectory.
+- Fraction of steps a run's loss lies above the first reference run: v4 0.95,
+  **reference rerun 0.95**, v5 0.87. The apparent "consistent offset" of v4 is shown
+  by the reference's own rerun too: the first reference run took a slightly lower
+  path; no bias. Quantifying the spread needs several seeds per implementation
+  (planned for the full replication on the RTX PRO 6000).
+- Step speedup 1.12x (hard) / 1.27x (soft); largest patch, hard: reference 208^3,
+  v4 / v5 224^3; soft: all 224^3.
