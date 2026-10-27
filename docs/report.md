@@ -563,3 +563,69 @@ fwd+bwd p50 ms (speedup vs reference); peak MiB, fp32 logits:
   (planned for the full replication on the RTX PRO 6000).
 - Step speedup 1.12x (hard) / 1.27x (soft); largest patch, hard: reference 208^3,
   v4 / v5 224^3; soft: all 224^3.
+
+## Sprint 11: closing the gaps (2026-10-27)
+
+Gaps from the Sprint 9 review, each a hypothesis; T4 runs
+`results/kaggle/60a3c6df2c3c-run-sprint11/` (gate: 1846 passed),
+`6ad66a182fc4-run-sprint11-precise/`, dev runs `06a7615…`, `d089be5…`.
+
+**Done**
+- `kernels/bins.py`: O(1) bin index (`floor(p*K)` + two exact correction rounds
+  against the reference's float32 edge table; tested on every float32 within 8 ulp of
+  every edge, K = 1..100, both `right`). Tensor-core reduction (one-hot @ fp16-split
+  values; side branch). Edge tables cached per device.
+- `kernels/epilogue.py`: per-bin epilogue + class reduction + jacobian in one launch.
+- `impls/v6_triton.py`: `v6_index`, `v6_triton` (+ epilogue, `torch.library` custom
+  ops), `v6_precise` (+ libdevice exp), `v6_dot` (side branch).
+- `module.py`: drop-in `HardL1ACELoss` / `SoftL1ACELoss` with the upstream signatures
+  (test: identical names / order / defaults; 43 cases vs the upstream classes on CPU
+  and CUDA); `impl="auto"` -> `v6_precise` on CUDA, `v2_recompute` elsewhere.
+- Bench: trained-network-like inputs (`target_bias`), deep-supervision sizes,
+  `torch.compile` modes + graph-break counts in e2e.
+
+### Results (fwd + bwd, T4)
+
+| hypothesis | result | verdict |
+|---|---|---|
+| O(1) index: hist kernel 1.3-2x (hard), 1.5-2.5x (soft) | hard hist 2.92 -> 2.79 ms; whole loss 1.05-1.15x (hard), 1.15-1.2x (soft) | partly: the per-block `[BLOCK, K]` reduction, not the index, dominates |
+| tensor-core reduction: 1.5-2.5x | **3.6-8x slower** (`v6_dot`) | refuted on T4: no tensor-core `tl.dot` on sm_75, the one-hot matmul runs on FMA units. Re-test on sm_80+ (RTX PRO 6000) |
+| fused epilogue: launches ~55 -> <= 8; small volumes 2-5x | **7 launches**; 32^3: 0.85 -> 0.05 ms (17x), 16^3: 0.89 -> 0.034 ms (26x) | confirmed, stronger than expected |
+| precise exp fixes brats21 hard L2 grad (2.9e-4) for <= 5% | 2.9e-4 -> 6.4e-5 (reference 6.2e-5), +0-6% time | confirmed: default in the module |
+| reference slower on trained-like inputs; ours insensitive | reference +17-60% slower (kits23 hard 99 -> 159 ms); v5/v6 within 3% | confirmed |
+| reference breaks `torch.compile` of the step; v6 does not | all 8 breaks are MONAI `DiceLoss` (`.tolist()`, 2 per level), for every loss; the reference ACE traces fine; v5 added 6 (autograd jacobian), v6 adds 0 | refuted for the reference; v6 compile-clean |
+
+Paper shapes (v6_triton, realistic-run numbers for kits23 — the paper run's first
+shape was ~1.4x slow for all Triton impls): kits23 hard **3.26 ms (30x)**, soft
+**4.92 ms (37x)**; brats21 12.5 / 18.0 ms; amos22 12.6 / 18.5 ms (**64x / 81x**); up to
+28% of peak bandwidth (the original target was 60-70%; gap: the hist kernel, 83-86%
+of v6's GPU time).
+
+**Deep supervision** (4 calls per step, SegResNetDS at 128^3, sum of levels):
+
+| | reference | v5 | v5 + CUDA graph | **v6_triton** |
+|---|---|---|---|---|
+| hard | 62.1 ms | 4.47 ms | 2.51 ms | **1.91 ms (33x)** |
+| soft | 118.5 ms | 5.78 ms | 4.05 ms | **2.82 ms (42x)** |
+
+v6 needs no CUDA graph (graph rows identical); v5 needed one at small sizes.
+
+**Accuracy**: same as v5 except the precise exp fix. On trained-like inputs the
+reference's loss is **2e-3 off the float64 value** (soft, kits23; hard 1e-4): ~70%
+of voxels fall into bin 0 and its sequential fp32 accumulation loses digits; v5/v6
+6e-6 / 1e-7 (block-wise tree sums). The "2e-3 vs reference" output-check rows on
+those inputs are the reference's error.
+
+**End-to-end** (128^3, AMP): eager step 1.10x (hard) / 1.23x (soft) vs reference
+(as v5); with `torch.compile` of network + loss: reference 1.11x / 1.37x, v6 1.24x /
+1.38x. Compiled, the reference soft loss is fused well by Inductor and the step
+gains converge (the network dominates). Curves within the reference's own rerun
+spread (soft rerun 18%, v6 4.6%). Largest patch: hard 208^3 (reference) vs 224^3.
+
+**Findings**
+- The remaining gap to the bandwidth limit is the histogram reduction (`[BLOCK, K]`
+  compare + 3 multiply-sums per voxel), not the binning. Next candidates: warp-level
+  privatized histograms, fewer padded bins (K = 20 -> 32 lanes), tensor cores on
+  sm_80+ (`v6_dot`, re-measure on the RTX PRO 6000).
+- One fused launch for all deep-supervision levels (plan 11.5) is not needed: after
+  the epilogue fusion the small levels cost 0.03-0.3 ms.
