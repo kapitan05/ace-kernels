@@ -8,7 +8,7 @@
 <aside class="side"><a class="brand" href="index.html">mL1-ACE kernels<br>
 <small>study guide</small></a><ol class="pages"><li class="current"><a href="index.html">Overview: map of the project</a></li><li class=""><a href="01-loss.html">1. The loss and why the original is slow</a></li><li class=""><a href="02-correctness.html">2. Proving &#x27;same as the original&#x27;</a></li><li class=""><a href="03-pytorch.html">3. PyTorch: vectorize, handwritten backward</a></li><li class=""><a href="04-triton.html">4. Triton kernels</a></li><li class=""><a href="05-sprint11.html">5. Sprint 11: launches, index, packaging</a></li><li class=""><a href="06-training.html">6. Training: end-to-end, torch.compile</a></li><li class=""><a href="07-tooling.html">7. Tooling: bench, Kaggle, W&amp;B, profiler</a></li><li class=""><a href="evidence.html">Evidence: claim -&gt; proof</a></li><li class=""><a href="glossary.html">Glossary</a></li></ol>
 <div class="toc"><b>On this page</b><ul><li><a href="#how-to-use-this-guide">How to use this guide</a></li><li><a href="#map-of-the-repository">Map of the repository</a></li><li><a href="#the-deliverable-and-its-data-flow">The deliverable and its data flow</a></li><li><a href="#the-ladder-at-a-glance">The ladder at a glance</a></li><li><a href="#sessions">Sessions</a></li></ul></div>
-<p class="meta">commit b407b4727f</p></aside>
+<p class="meta">commit 089df3e038</p></aside>
 <main><p class="sprints">Sprints: all</p><h1 id="study-guide-making-the-ml1-ace-loss-fast-on-the-gpu">Study guide: making the mL1-ACE loss fast on the GPU</h1>
 <p>This guide teaches the whole project: the loss, why the original implementation is
 slow, every optimization step (sprints 1-11), how each step is <strong>proven</strong> correct and
@@ -93,23 +93,25 @@ you do not need a GPU to study them. Rebuild this guide any time:</p>
 </table>
 <p>Every implementation is registered under a name and called the same way, which is
 what makes the ladder comparable step by step:</p>
-<figure class="code"><div class="code-head"><span class="path">src/ace_kernels/registry.py:78-100</span><a href="https://github.com/kapitan05/ace-kernels/blob/b407b4727fb5e70160d718f64cf7debc8ea716c3/src/ace_kernels/registry.py#L78-L100" target="_blank" rel="noopener">GitHub</a></div><div class="highlight"><pre><span></span><span class="linenos"> 78</span><span class="k">def</span><span class="w"> </span><span class="nf">ace_loss</span><span class="p">(</span>
-<span class="linenos"> 79</span>    <span class="nb">input</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-<span class="linenos"> 80</span>    <span class="n">target</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-<span class="linenos"> 81</span>    <span class="n">config</span><span class="p">:</span> <span class="n">ACEConfig</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-<span class="linenos"> 82</span>    <span class="n">impl</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"reference"</span><span class="p">,</span>
-<span class="linenos"> 83</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="linenos"> 84</span><span class="w">    </span><span class="sd">"""Compute the mL1-ACE loss with the chosen implementation.</span>
-<span class="linenos"> 85</span>
-<span class="linenos"> 86</span><span class="sd">    Args:</span>
-<span class="linenos"> 87</span><span class="sd">        input: logits or probabilities, shape ``[B, C, *spatial]``.</span>
-<span class="linenos"> 88</span><span class="sd">        target: one-hot ``[B, C, *spatial]``, or labels ``[B, 1, *spatial]``</span>
-<span class="linenos"> 89</span><span class="sd">            when ``config.to_onehot_y`` is set.</span>
-<span class="linenos"> 90</span><span class="sd">        config: loss options; defaults to ``ACEConfig()``.</span>
-<span class="linenos"> 91</span><span class="sd">        impl: registered implementation name.</span>
-<span class="linenos"> 92</span><span class="sd">    """</span>
-<span class="linenos"> 93</span>    <span class="n">config</span> <span class="o">=</span> <span class="n">config</span> <span class="k">if</span> <span class="n">config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">ACEConfig</span><span class="p">()</span>
-<span class="linenos"> 94</span>    <span class="n">spec</span> <span class="o">=</span> <span class="n">get_impl</span><span class="p">(</span><span class="n">impl</span><span class="p">)</span>
+<figure class="walk"><div class="code-head"><span class="path">walk-through: src/ace_kernels/registry.py:78-100</span><a href="https://github.com/kapitan05/ace-kernels/blob/089df3e03805da8196e93d3acba6b27bcfe9ac58/src/ace_kernels/registry.py#L78-L100" target="_blank" rel="noopener">GitHub</a></div><div class="step"><div class="step-code"><div class="highlight"><pre><span></span><span class="linenos">78</span><span class="k">def</span><span class="w"> </span><span class="nf">ace_loss</span><span class="p">(</span>
+<span class="linenos">79</span>    <span class="nb">input</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+<span class="linenos">80</span>    <span class="n">target</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+<span class="linenos">81</span>    <span class="n">config</span><span class="p">:</span> <span class="n">ACEConfig</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<span class="linenos">82</span>    <span class="n">impl</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"reference"</span><span class="p">,</span>
+<span class="linenos">83</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="linenos">84</span><span class="w">    </span><span class="sd">"""Compute the mL1-ACE loss with the chosen implementation.</span>
+<span class="linenos">85</span>
+<span class="linenos">86</span><span class="sd">    Args:</span>
+<span class="linenos">87</span><span class="sd">        input: logits or probabilities, shape ``[B, C, *spatial]``.</span>
+<span class="linenos">88</span><span class="sd">        target: one-hot ``[B, C, *spatial]``, or labels ``[B, 1, *spatial]``</span>
+<span class="linenos">89</span><span class="sd">            when ``config.to_onehot_y`` is set.</span>
+<span class="linenos">90</span><span class="sd">        config: loss options; defaults to ``ACEConfig()``.</span>
+<span class="linenos">91</span><span class="sd">        impl: registered implementation name.</span>
+<span class="linenos">92</span><span class="sd">    """</span>
+</pre></div>
+</div><div class="step-note"><p><strong>The one entry point.</strong> Every implementation (reference, v1 ... v6) has the same signature: logits (or probabilities), target, config. Tests, benchmarks and the training harness only change the <code>impl</code> string.</p></div></div><div class="step"><div class="step-code"><div class="highlight"><pre><span></span><span class="linenos">93</span>    <span class="n">config</span> <span class="o">=</span> <span class="n">config</span> <span class="k">if</span> <span class="n">config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">ACEConfig</span><span class="p">()</span>
+</pre></div>
+</div><div class="step-note"><p><code>ACEConfig</code> holds every option of the upstream loss (bins, binning, activation, background, empty classes, weights, reduction, <code>right</code>, empty weight), validated once.</p></div></div><div class="step"><div class="step-code"><div class="highlight"><pre><span></span><span class="linenos"> 94</span>    <span class="n">spec</span> <span class="o">=</span> <span class="n">get_impl</span><span class="p">(</span><span class="n">impl</span><span class="p">)</span>
 <span class="linenos"> 95</span>    <span class="k">if</span> <span class="ow">not</span> <span class="n">spec</span><span class="o">.</span><span class="n">supports</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">binning</span><span class="p">,</span> <span class="nb">input</span><span class="o">.</span><span class="n">device</span><span class="o">.</span><span class="n">type</span><span class="p">):</span>
 <span class="linenos"> 96</span>        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
 <span class="linenos"> 97</span>            <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">impl</span><span class="si">!r}</span><span class="s2"> does not support binning=</span><span class="si">{</span><span class="n">config</span><span class="o">.</span><span class="n">binning</span><span class="si">!r}</span><span class="s2"> "</span>
@@ -117,7 +119,7 @@ what makes the ladder comparable step by step:</p>
 <span class="linenos"> 99</span>        <span class="p">)</span>
 <span class="linenos">100</span>    <span class="k">return</span> <span class="n">spec</span><span class="o">.</span><span class="n">fn</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">target</span><span class="p">,</span> <span class="n">config</span><span class="p">)</span>
 </pre></div>
-<p class="code-note">One entry point for all implementations: same inputs, same config, only <code>impl</code> changes. Tests and benchmarks loop over the registry.</p></figure>
+</div><div class="step-note"><p>Look the name up in the registry (filled by <code>@register(...)</code> decorators when <code>ace_kernels.impls</code> is imported) and refuse unsupported combinations (e.g. a Triton implementation on the CPU) with a clear error.</p></div></div></figure>
 <h2 id="the-deliverable-and-its-data-flow">The deliverable and its data flow</h2>
 <figure class="diagram"><svg viewBox="0 0 900 250" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, Segoe UI, sans-serif" font-size="12" role="img" aria-label="Data flow of the deliverable: forward and backward kernels">
 <style>.b{fill:var(--surface);stroke:var(--line);stroke-width:1.2}.k{fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.2}.h{fill:var(--ink);font-weight:700}.s{fill:var(--ink-2);font-size:11px}.a{stroke:var(--muted);stroke-width:1.5;fill:none;marker-end:url(#ar3)}</style>
@@ -138,7 +140,7 @@ what makes the ladder comparable step by step:</p>
 </figure>
 <p>The user-facing class only translates the upstream constructor into an <code>ACEConfig</code>
 and picks the implementation for the device:</p>
-<figure class="code"><div class="code-head"><span class="path">src/ace_kernels/module.py:90-94</span><a href="https://github.com/kapitan05/ace-kernels/blob/b407b4727fb5e70160d718f64cf7debc8ea716c3/src/ace_kernels/module.py#L90-L94" target="_blank" rel="noopener">GitHub</a></div><div class="highlight"><pre><span></span><span class="linenos">90</span>    <span class="k">def</span><span class="w"> </span><span class="nf">resolve_impl</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<figure class="code"><div class="code-head"><span class="path">src/ace_kernels/module.py:90-94</span><a href="https://github.com/kapitan05/ace-kernels/blob/089df3e03805da8196e93d3acba6b27bcfe9ac58/src/ace_kernels/module.py#L90-L94" target="_blank" rel="noopener">GitHub</a></div><div class="highlight"><pre><span></span><span class="linenos">90</span>    <span class="k">def</span><span class="w"> </span><span class="nf">resolve_impl</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
 <span class="linenos">91</span><span class="w">        </span><span class="sd">"""Implementation used for inputs on ``device``."""</span>
 <span class="linenos">92</span>        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">impl</span> <span class="o">!=</span> <span class="s2">"auto"</span><span class="p">:</span>
 <span class="linenos">93</span>            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">impl</span>

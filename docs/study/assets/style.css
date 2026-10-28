@@ -93,3 +93,19 @@ figure.diagram svg { max-width: 100%; height: auto; }
   .toc { display: none; }
   main { padding: 20px 16px 60px; }
 }
+figure.walk { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.step { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+  border-top: 1px solid var(--line); }
+.step:first-of-type { border-top: 0; }
+.step-code { background: var(--code-bg); overflow-x: auto; }
+.step-code .highlight, .step-code pre { margin: 0; }
+.step-code pre { padding: 10px 12px; font-size: .8rem; background: transparent; }
+.step-note { padding: 10px 14px; font-size: .9rem; border-left: 3px solid var(--accent);
+  background: var(--bg); }
+.step-note p { margin: 0 0 8px; }
+.step-note p:last-child { margin-bottom: 0; }
+.step-note ul { margin: 4px 0; padding-left: 18px; }
+@media (max-width: 1100px) {
+  .step { grid-template-columns: 1fr; }
+  .step-note { border-left: 0; border-top: 2px solid var(--accent); }
+}

@@ -12,6 +12,9 @@ build fails on a missing symbol, file or run; ``tests/test_study.py``):
     ::run <shell command> [| <what to expect>]
     ::check <question> | <answer>
     ::svg <name>                                docs/study/src/diagrams/<name>.svg
+    ::walk <path>::<Name> (or <path>:<a>-<b>)   code in chunks, each explained:
+    @ <text on the chunk's first line> | <explanation (Markdown)>
+    ::end
     ::exec                                      Python run at build time (CPU);
     <python lines>                              the code and its printed output
     ::end                                       are shown (worked examples)
@@ -124,8 +127,8 @@ class Builder:
 
     # --- directives -------------------------------------------------------
 
-    def code(self, arg: str) -> str:
-        spec, _, note = (s.strip() for s in arg.partition("|"))
+    def _locate(self, spec: str) -> tuple[str, int, int, list[str]]:
+        """``path::Symbol`` or ``path:first-last`` -> (rel, first, last, lines)."""
         if "::" in spec:
             rel, name = spec.split("::", 1)
             path = REPO_ROOT / rel
@@ -143,7 +146,9 @@ class Builder:
         lines = path.read_text().splitlines()
         if last > len(lines):
             raise BuildError(f"{rel}: lines {first}-{last} beyond end ({len(lines)})")
-        snippet = "\n".join(lines[first - 1 : last])
+        return rel, first, last, lines
+
+    def _highlight(self, rel: str, lines: list[str], first: int, last: int) -> str:
         formatter = HtmlFormatter(
             cssclass="highlight", linenos="inline", linenostart=first
         )
@@ -151,15 +156,65 @@ class Builder:
             lexer = get_lexer_for_filename(rel)
         except ClassNotFound:
             lexer = PythonLexer()
-        body = highlight(snippet, lexer, formatter)
+        return highlight("\n".join(lines[first - 1 : last]), lexer, formatter)
+
+    def _head(self, rel: str, first: int, last: int, label: str = "") -> str:
         url = f"{GITHUB}/{self.commit}/{rel}#L{first}-L{last}"
-        head = (
-            f'<div class="code-head"><span class="path">{html.escape(rel)}'
+        return (
+            f'<div class="code-head"><span class="path">{label}{html.escape(rel)}'
             f":{first}-{last}</span>"
             f'<a href="{url}" target="_blank" rel="noopener">GitHub</a></div>'
         )
+
+    def code(self, arg: str) -> str:
+        spec, _, note = (s.strip() for s in arg.partition("|"))
+        rel, first, last, lines = self._locate(spec)
+        body = self._highlight(rel, lines, first, last)
+        head = self._head(rel, first, last)
         note_html = f'<p class="code-note">{_inline(note)}</p>' if note else ""
         return f'<figure class="code">{head}{body}{note_html}</figure>'
+
+    def walk(self, spec: str, steps: list[str]) -> str:
+        """Code split at anchor lines, each chunk with its explanation.
+
+        ``steps``: lines ``@ <text on the chunk's first line> | <explanation>``;
+        other lines continue the previous explanation. Anchors are searched in
+        order inside the excerpt, so a renamed or moved line fails the build.
+        """
+        rel, first, last, lines = self._locate(spec.strip())
+        parsed: list[tuple[str, str]] = []
+        for raw in steps:
+            if raw.startswith("@ "):
+                anchor, sep, note = raw[2:].partition(" | ")
+                if not sep:
+                    raise BuildError(f"::walk step needs ' | ': {raw!r}")
+                parsed.append((anchor.strip(), note.strip()))
+            elif parsed:
+                parsed[-1] = (parsed[-1][0], parsed[-1][1] + "\n" + raw)
+        if not parsed:
+            raise BuildError(f"::walk {spec}: no steps")
+        starts: list[int] = []
+        pos = first
+        for anchor, _ in parsed:
+            hit = next(
+                (n for n in range(pos, last + 1) if anchor in lines[n - 1]), None
+            )
+            if hit is None:
+                raise BuildError(
+                    f"::walk {rel}: anchor {anchor!r} not found after L{pos}"
+                )
+            starts.append(hit)
+            pos = hit + 1
+        starts[0] = first  # decorators / signature before the first anchor
+        ends = [s - 1 for s in starts[1:]] + [last]
+        chunks = "".join(
+            f'<div class="step"><div class="step-code">'
+            f"{self._highlight(rel, lines, a, b)}</div>"
+            f'<div class="step-note">{markdown.markdown(note)}</div></div>'
+            for (_, note), a, b in zip(parsed, starts, ends, strict=True)
+        )
+        head = self._head(rel, first, last, "walk-through: ")
+        return f'<figure class="walk">{head}{chunks}</figure>'
 
     def plot(self, arg: str) -> str:
         parts = [s.strip() for s in arg.split("|")]
@@ -266,6 +321,21 @@ class Builder:
                 if end is None:
                     raise BuildError("::exec without ::end")
                 blocks.append(self.exec_block("\n".join(lines[i + 1 : end])))
+                md_lines += ["", f"STUDYBLOCK{len(blocks) - 1}X", ""]
+                i = end + 1
+                continue
+            if line.startswith("::walk "):
+                end = next(
+                    (
+                        j
+                        for j in range(i + 1, len(lines))
+                        if lines[j].strip() == "::end"
+                    ),
+                    None,
+                )
+                if end is None:
+                    raise BuildError("::walk without ::end")
+                blocks.append(self.walk(line[len("::walk ") :], lines[i + 1 : end]))
                 md_lines += ["", f"STUDYBLOCK{len(blocks) - 1}X", ""]
                 i = end + 1
                 continue

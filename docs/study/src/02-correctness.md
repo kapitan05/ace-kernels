@@ -27,7 +27,14 @@ The reference's outputs (loss and input gradient) for the 43 named cases are sto
 once in `tests/golden/`. One parametrized test runs every registered implementation on
 every case and device:
 
-::code tests/test_golden.py::test_matches_golden | The registry makes this one test cover all 18 implementations: adding v6 required no new comparison code.
+::walk tests/test_golden.py::test_matches_golden
+@ @pytest.mark.parametrize("device", DEVICES) | **Three parametrizations multiply**: every device (CPU, and CUDA when present) x every golden case (43) x every registered implementation (18). pytest generates one test per combination: ~1500 tests from 15 lines. `available_impls()` reads the registry, so a new implementation is covered automatically.
+@ record = GOLDEN[case_name] | A golden record holds the exact input tensor, target, config, and the reference's loss and input gradient, computed once by `scripts/make_golden.py` and stored in `tests/golden/reference_cases.pt` (so the test does not depend on the reference running correctly today).
+@ skip_unless_supported(impl, config.binning, device, case_name) | Skips combinations an implementation does not support (e.g. Triton versions on the CPU), and limits `slow` implementations (`torch.compile` recompiles for every new shape) to a few smoke cases.
+@ result = run(impl, x, y, config) | `run` (in `tests/helpers.py`) makes a fresh leaf tensor, computes the loss, backpropagates `loss.sum()` and returns loss + input gradient.
+@ if get_impl(impl).slow and case_name in TIE_CASES: | Tie cases (exact `mean p == mean y` in a bin) have a legitimately different subgradient under compiled code: only the loss is checked exactly there, the gradient for finiteness.
+@ assert_same(result, expected) | Loss and gradient compared with the documented tolerances (loss 1e-5 relative; gradient 1e-4 CPU / 1e-3 CUDA).
+::end
 
 The cases are the edge conditions where an implementation is most likely to differ:
 
@@ -39,7 +46,13 @@ Golden files only prove "same as the reference". The oracle re-implements the pa
 formula independently, in float64 NumPy, voxel by voxel, so a bug shared by the
 reference and our code would still be caught:
 
-::code tests/oracle.py::oracle_ace | Written from the formula, not from the upstream code; only the bin-edge table is shared (float32 linspace, so edge voxels are binned like the reference).
+::walk tests/oracle.py:31-96
+@ def _hard_weights(p: F64, num_bins: int, right: bool) -> F64: | **Hard weights** as a dense `[N, K]` matrix in float64 NumPy: 1 in the column of each voxel's bin. `np.searchsorted` plays the role of `torch.bucketize`; the edge table is the reference's float32 linspace converted to float64, so edge voxels fall into the same bin.
+@ def _soft_weights(p: F64, num_bins: int) -> F64: | **Soft weights** written straight from the definition, one voxel at a time: below the first centre or above the last, all weight on the end bin; otherwise linear interpolation `1 - t` / `t` between the two neighbouring centres. Slow and obviously correct, which is the point of an oracle.
+@ def _slice_error(p: F64, y: F64, config: ACEConfig) -> float: | **The formula itself** for one (b, c) slice: per non-empty bin k, `|w_k · p - w_k · y| / W_k` (weighted means), then the mean over non-empty bins. Matrix-vector products in float64: no summation-order issues at test sizes.
+@ def oracle_ace(input: F64, target: F64, config: ACEConfig) -> F64: | **Activation** in float64 (numerically stable softmax: subtract the max), optional background removal, then the slice error for every (b, c).
+@ if config.ignore_empty_classes: | Empty-class mask, class weights and reduction, mirroring the options of the upstream class. `test_oracle.py` asserts the *reference* matches this on all 43 cases: the ground truth is itself verified.
+::end
 
 ## Tolerances: what "same" means in floating point
 
@@ -61,7 +74,24 @@ Unit tests use small tensors. In every benchmark row, the harness also checks th
 implementation at the real size against the reference **and** against a float64
 computation (the handwritten-backward PyTorch version in float64):
 
-::code src/ace_bench/measure.py::_check_output | Fills `loss_rel_err`, `grad_rel_err`, `grad_l2_err` (vs reference) and `*_truth` columns (vs float64). The reference's own error vs truth is stored too, so "as accurate as the original" is a measured statement.
+Before measuring an implementation, the harness computes the reference's result **and**
+a float64 truth on the same benchmark input:
+
+::walk src/ace_bench/measure.py:151-194
+@ def compute_reference( | Runs once per (shape, binning) group, on the exact input the timed rows will use (same seed, same distribution parameters, same storage dtype).
+@ for impl in ("reference", FALLBACK_REFERENCE): | The upstream reference first; if it runs **out of memory** (soft binning at 288^3), fall back to `v2_recompute` (itself verified against the reference on all tests). The row records which one was used (`checked_against`).
+@ try:  # float64 truth on the same (already rounded) input values | **The float64 truth**: the same input values (after fp32/fp16 rounding, so input rounding is not counted as error) through `v2_recompute` in float64. Then the reference's *own* error against this truth is stored: the yardstick for "as accurate as the original".
+::end
+
+Then, for every implementation and row:
+
+::walk src/ace_bench/measure.py::_check_output
+@ def _check_output( | Called for every benchmark row (unless `verify: false` in the config), on the same input as the timing.
+@ row.checked_against = ref.impl | Copies the reference's own errors vs truth into the row, so every row can be judged on its own.
+@ if impl == ref.impl: | Loss and gradient of the implementation (reused if it *is* the reference).
+@ row.loss_rel_err, row.grad_rel_err = _rel(loss, ref.loss), _rel(grad, ref.grad) | **vs the reference**: `_rel` = max absolute difference / max |reference| (max-norm, diagnostic); `_rel_l2` = ‖a - b‖ / ‖b‖ over the whole gradient (the robust measure).
+@ if ref.truth_loss is not None and ref.truth_grad is not None: | **vs float64 truth**: the same three errors. The report flags a row when its loss or L2 gradient error is more than 2x the reference's own error vs truth.
+::end
 
 ## Worked example: why max-norm gradient errors mislead
 

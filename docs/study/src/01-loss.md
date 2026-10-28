@@ -60,11 +60,26 @@ The upstream loss (`src/ace_reference/hardl1ace.py`, frozen and SHA-checked) com
 the per-bin statistics with a Python loop over batch x class, and three scatter
 operations per slice:
 
-::code src/ace_reference/hardl1ace.py:70-105 | For every (b, c): `bucketize` finds the bins; `scatter_add` counts voxels per bin; two `scatter_reduce(mean)` compute mean p and mean y. Each scatter makes every voxel do an **atomic add** into one of only K = 20 addresses.
+::walk src/ace_reference/hardl1ace.py:70-105
+@ batch_size, num_channels = input.shape[:2] | **Bin edges.** `boundaries` holds K+1 equally spaced values from 0 to `1 + eps32` (the tiny extra `eps32 = 1.19e-7` makes a probability of exactly 1.0 fall *inside* the last bin instead of past it). Only `boundaries[1:]` (the K upper edges) is used below. Note it is a **float32** tensor: its values are not exactly `k/K`, which is why every later implementation must use this same table to get bit-identical bins.
+@ mean_p_per_bin = torch.zeros( | **Output buffers**, one row of K bins per (batch, class) pair: mean prediction, mean target and voxel count per bin. Shape `[B, C, K]`, tiny (640 values for B=2, C=4, K=20).
+@ input = input.flatten(start_dim=2).float() | Spatial dimensions are flattened: a 3D volume `[B, C, X, Y, Z]` becomes `[B, C, N]` with N = X·Y·Z voxels. `.float()` copies the target to float32 (a full extra copy of the target tensor).
+@ for b in range(batch_size): | **The Python loop** over every (b, c) pair: 2 x 4 = 8 iterations for kits23, 2 x 16 = 32 for amos22. Each iteration launches several GPU kernels, so the number of launches grows with B·C (428 per call for kits23 hard).
+@ bin_idx = torch.bucketize( | `bucketize` returns, for each of the N probabilities of this slice, the index of its bin: the number of edges smaller than p (`right=False`). This allocates an **int64 tensor of N elements** (8 bytes per voxel), which autograd keeps for the backward.
+@ bin_counts[b, c, :] = torch.zeros_like(boundaries[1:]).scatter_add( | **Counting.** `scatter_add` adds 1 at position `bin_idx[i]` for every voxel i. On the GPU, every voxel's thread does an *atomic* add into one of only K = 20 addresses: millions of colliding atomics. This is the contention that costs 84% of the original's GPU time.
+@ mean_p_per_bin[b, c, :] = torch.empty_like(boundaries[1:]).scatter_reduce( | **Means per bin**, again by scattering all N voxels: `scatter_reduce(..., reduce="mean")` for the probabilities and once more for the targets. Two more full passes over the data, two more rounds of atomics. `include_self=False` ignores the uninitialized `empty_like` values.
+@ # Remove nonsense bins: | Bins with no voxels get NaN means, so that the later `nanmean` skips them. This boolean-mask assignment is another pass over `[B, C, K]` (cheap) but uses a mask that autograd also has to track.
+::end
 
-Then the loss itself is three lines:
+Then the loss itself, from the per-bin means:
 
-::code src/ace_reference/hardl1ace.py:233-241 | `nanmean` skips empty bins (their means were set to NaN); classes absent from the target are masked out.
+::walk src/ace_reference/hardl1ace.py:233-278
+@ mean_p_per_bin, mean_gt_per_bin, bin_counts = hard_binned_calibration( | Calls the binning function above; the activation (softmax) and the one-hot conversion of the target already happened earlier in `forward`.
+@ f = torch.nanmean(torch.abs(mean_p_per_bin - mean_gt_per_bin), dim=-1) | **The loss per (b, c)**: absolute gap per bin, averaged over the K bins while skipping NaN (= empty) bins. Result `[B, C]`. The gradient flows back through `abs` (the sign of the gap) and the means.
+@ if self.ignore_empty_classes: | Classes that do not occur in this volume's target contribute 0 (otherwise an absent class would still be penalized). `target.sum(...)` reads the **whole** target tensor again just to find which classes are present; v4 later derives presence from the per-bin target sums instead, at no cost.
+@ num_of_classes = target.shape[1] | **Class weights** (optional): validated, then multiplied into `f`. `torch.as_tensor` on a Python list creates a CPU tensor and `.to(f)` copies it to the GPU on every call: a host-to-device copy (harmless for speed, but it prevents CUDA-graph capture; our versions use Python scalars).
+@ if self.reduction == LossReduction.MEAN.value: | **Reduction** over the `[B, C]` values: mean (the paper's setting), sum, or none (keeps a broadcastable `[B, C, 1, 1, 1]` shape).
+::end
 
 Autograd differentiates all of this automatically, which means it **stores**
 intermediate per-voxel tensors (bin indices, one-hot targets, gathered values) for the
@@ -109,7 +124,14 @@ is wrong. The harness records CUDA events around each call, synchronizes, flushe
 L2 cache before each repetition (so data is read from DRAM as in training) and reports
 the median of 10+ repetitions:
 
-::code src/ace_bench/timing.py::measure | Warm-up calls first (Triton autotuning, cuDNN selection), then timed repetitions with a cold L2 each.
+::walk src/ace_bench/timing.py::measure
+@ for _ in range(warmup): | **Warm-up calls are not timed.** The first calls compile Triton kernels, run the autotuner (it tries several block sizes), pick cuDNN algorithms and grow the memory allocator; timing them would measure setup, not the loss.
+@ if device != "cuda": | On the CPU, a simple wall clock is correct: CPU work is synchronous.
+@ flush = torch.empty(_L2_FLUSH_BYTES | **Why events and a flush.** A 256 MB buffer (larger than the T4's 4 MB L2 cache) and one pair of CUDA events per repetition are created *before* timing, so allocation is not measured.
+@ torch.cuda.synchronize() | Wait until all previous GPU work has finished, so the first measured repetition starts from an idle GPU.
+@ for start, end in zip(starts, ends, strict=True): | Each repetition: `flush.zero_()` writes 256 MB, evicting the loss's data from the L2 cache, so the call reads its inputs from DRAM as it would in training (where the network ran in between). `start.record()` / `end.record()` put timestamps **into the GPU's stream**: they measure GPU execution time, not the Python call (which returns before the GPU finishes).
+@ torch.cuda.synchronize() | One synchronization at the end, then the elapsed time of each event pair. `_summarize` reports median (p50), p20, p80, mean and standard deviation; the tables in this guide use the median, which is robust to outliers.
+::end
 
 ## Try it
 

@@ -44,7 +44,11 @@ Five parts, each with one job:
 Every implementation is registered under a name and called the same way, which is
 what makes the ladder comparable step by step:
 
-::code src/ace_kernels/registry.py::ace_loss | One entry point for all implementations: same inputs, same config, only `impl` changes. Tests and benchmarks loop over the registry.
+::walk src/ace_kernels/registry.py::ace_loss
+@ def ace_loss( | **The one entry point.** Every implementation (reference, v1 ... v6) has the same signature: logits (or probabilities), target, config. Tests, benchmarks and the training harness only change the `impl` string.
+@ config = config if config is not None else ACEConfig() | `ACEConfig` holds every option of the upstream loss (bins, binning, activation, background, empty classes, weights, reduction, `right`, empty weight), validated once.
+@ spec = get_impl(impl) | Look the name up in the registry (filled by `@register(...)` decorators when `ace_kernels.impls` is imported) and refuse unsupported combinations (e.g. a Triton implementation on the CPU) with a clear error.
+::end
 
 ## The deliverable and its data flow
 

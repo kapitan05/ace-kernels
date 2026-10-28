@@ -12,13 +12,27 @@ every (b, c) slice its own block of K bins in one flat buffer of size B*C*K: vox
 `i` of slice `r` goes to flat bin `r*K + bin(p_i)`. One scatter then handles all
 slices at once.
 
-::code src/ace_kernels/impls/v1_vectorized.py::_hard | `v1_vectorized`: the reference's three scatters, but over all slices at once via `_row_offsets` (row * K). Same operations otherwise, so it isolates the effect of the loop.
+::walk src/ace_kernels/impls/v1_vectorized.py:17-46
+@ def _row_offsets(prep: Prepared, num_bins: int) -> torch.Tensor: | **The trick that removes the loop.** Number the B·C slices 0..B·C-1 (`[B, C, 1]` tensor) and multiply by K: slice r owns flat bins `r*K .. r*K+K-1` of one buffer of size B·C·K.
+@ def _hard(prep: Prepared, config: ACEConfig) -> torch.Tensor: | `prep` (from `common.prepare`) holds the activated probabilities `[B, C, N]` and the one-hot target.
+@ idx = torch.bucketize(p, hard_edges(k, p.device), right=config.right) | One `bucketize` for **all** slices at once (same edge table as the reference), then the slice offset is added: `flat[i]` is now a unique bin address across the whole batch.
+@ counts = torch.zeros(size, device=p.device).scatter_add( | The reference's three scatters, but each **once** over the flattened batch instead of B·C times: far fewer launches. The atomic collisions are the same (still millions of voxels into K addresses per slice), so the speedup is only 1.2x: the evidence that launches were not the problem.
+@ # copy before masking, like the reference's slice assignment: scatter_reduce | Empty bins -> NaN, as in the reference. The `.clone()` matters for autograd: `scatter_reduce` needs its output unchanged for its backward, and an in-place mask would corrupt it.
+@ return (mean_p - mean_gt).abs().view(b, c, k) | Per-bin absolute gaps `[B, C, K]`; the shared `finalize` (nanmean, class mask, weights, reduction) turns them into the loss.
+::end
 
 `v1_clean` then removes the remaining waste: sums instead of `scatter_reduce(mean)`
 (means are computed per bin afterwards), no one-hot target copy (class indices are
 used directly), no host-device synchronization. The shared statistics function:
 
-::code src/ace_kernels/binning.py::hard_stats | Three `scatter_add` into `[B*C*K]`: counts, sum of p, sum of y. For index targets, the target sum only scatters the *true* class of each voxel (1 value per voxel instead of C).
+::walk src/ace_kernels/binning.py::hard_stats
+@ idx = hard_bin_index(prep, config) | Bin of every voxel and channel, `[B, C, N]` int64, with the reference's edges and `right` convention.
+@ flat = (idx + rows(prep) * k).flatten() | Same flat addressing as v1 (`rows` = slice number b·C + c).
+@ zeros = p.new_zeros(b * c * k) | **Sums instead of means.** Three `scatter_add` into fresh zero buffers: count (adds a broadcast scalar 1, no ones-tensor allocated), sum of p. Means are computed later per bin (`sum / count`), which is cheaper than `scatter_reduce(mean)` and gives the per-bin sums the handwritten backward needs anyway.
+@ if prep.onehot is not None: | Target sum. With a one-hot target: scatter it like p (C values per voxel, mostly zeros).
+@ else: | With **class indices** (the paper's setting): each voxel has exactly one true class, so only that class's bin gets +1. `true_class` gives the voxel's class channel; `idx.gather` looks up the bin of the voxel *in that channel*. One value per voxel instead of C: no one-hot tensor is ever built.
+@ shape = (b, c, k) | `BinStats(count, sum_p, sum_gt, empty)`: the whole forward state in four `[B, C, K]` tensors. Every later implementation (including the Triton kernels) produces exactly this.
+::end
 
 **Result.** Removing the loop alone: 1.2x. The cleanup: 2.6x. With `torch.compile`
 on top: ~5x. Still under 5% of the hardware limit, because the scatters (atomics)
@@ -44,13 +58,28 @@ The backward therefore needs only `coef` and `d`: two `[B, C, K]` tensors (640 b
 for B=2, C=4, K=20), plus the inputs that the caller holds anyway. It recomputes each
 voxel's bin from `p` instead of storing it.
 
-::code src/ace_kernels/impls/v2_autograd.py::coefficients | The whole per-bin "state" of the backward: `d`, the per-class error `f`, presence, and `coef = sign(d) / (K_ne W)` (0 for empty bins).
+::walk src/ace_kernels/impls/v2_autograd.py::coefficients
+@ d = bin_difference(stats) | `d_k = sum_p/W - sum_y/W` per bin (two divisions then subtract, exactly like the reference's two means, so the sign at exact ties matches), 0 for empty bins.
+@ f = torch.nanmean(per_bin_error(stats), dim=-1) | Per-class loss `f = mean over non-empty bins of |d_k|` (empty bins are NaN and skipped), `[B, C]`.
+@ nonempty = ~stats.empty | **K_ne**, the number of non-empty bins per (b, c), `[B, C, 1]` so it broadcasts over bins. `clamp_min(1)` avoids dividing by zero when every bin is empty (then all coef are 0 anyway).
+@ safe_w = torch.where(nonempty, stats.weight, torch.ones_like(stats.weight)) | `coef_k = sign(d_k) / (K_ne · W_k)`: the derivative of `f` with respect to each voxel's probability in bin k (hard binning). Empty bins get 0 (no voxel can receive gradient from them). `safe_w` avoids 0/0 = NaN in the discarded branch of `where` (NaN would poison the gradient even when not selected).
+@ return f, class_present(stats), coef, d | Class presence from the stats (`sum_k G_k > 0`, equal to `target.sum() > 0`): saves reading the target again.
+::end
 
-::code src/ace_kernels/impls/v2_autograd.py::_df_dprobs | Backward, per voxel: hard = gather `coef` at the voxel's bin; soft = the two-sided formula with `w' = -1/S, +1/S`.
+::walk src/ace_kernels/impls/v2_autograd.py::_df_dprobs
+@ if config.binning == "hard": | **Hard**: every voxel gets the coefficient of its own bin. `hard_bin_index` recomputes the bins from p (nothing was stored), `gather` reads `coef[b, c, bin]` for each voxel: `[B, C, N]`.
+@ p = prep.probs | **Soft**: recompute each voxel's two neighbouring bins, weights and span S (`soft_assign`, the same function as the forward).
+@ resid = p - _true_target(prep)  # p_i - y_i | The derivation's formula per side j ∈ {left, right}: `coef_j · (w_j + w'_j (p - y - d_j))` with `w'_left = -1/S`, `w'_right = +1/S`. The `w'` term exists because moving p also moves the voxel's *weights* between the two bins.
+::end
 
 The `autograd.Function` ties it together; `mode` selects what is saved:
 
-::code src/ace_kernels/impls/v2_autograd.py::_ACELoss | `recompute` saves inputs + `coef`, `d`, presence; `grad_in_fwd` computes the full gradient already in the forward and only scales it in backward (the Liger-kernel trick: 1x input memory, no second pass).
+::walk src/ace_kernels/impls/v2_autograd.py::_ACELoss
+@ class _ACELoss(torch.autograd.Function): | A custom `torch.autograd.Function`: we write `forward` and `backward` ourselves; autograd does not record the operations inside `forward`, so it stores nothing on its own.
+@ prep = prepare(input, target, config, keep_labels=True) | Forward: activation, statistics, coefficients, loss. All voxel-sized intermediates are temporaries, freed when `forward` returns.
+@ if mode == "triton_bwd":  # tiny saves only: coef and the reduction's jacobian | **What to keep for backward** (`ctx.save_for_backward`), by mode: `triton_bwd` (v4) and `recompute` (v2) save the inputs (which the caller holds anyway: no extra memory) plus the `[B, C, K]` coef / d and a `[B, C]` tensor. `grad_in_fwd` instead computes the full input gradient now (for an upstream gradient of 1) and saves only that.
+@ def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[Any, ...]: | Backward receives `dL/dloss` (`grad_output`) and must return one gradient per forward input (None for target, config, mode, backend). `grad_in_fwd`: scale the precomputed gradient. `recompute`: rebuild everything from inputs + coef (`_input_grad`: `_df_dprobs`, upstream factor, activation backward).
+::end
 
 ## Worked example: the formula vs autograd
 
@@ -94,7 +123,12 @@ descent lowers their probabilities. Bins 1 and 2 are under-confident and get pus
 The saved-tensor hooks of PyTorch see every tensor autograd keeps for backward. The
 harness wraps a call and sums their sizes (excluding the inputs):
 
-::code src/ace_kernels/instrumentation.py::measure_saved_tensors | The pack hook returns `t.detach()`: returning `t` itself created a reference cycle that leaked GPU memory (a Sprint 3 harness bug that caused 38 out-of-memory rows; see page 7).
+::walk src/ace_kernels/instrumentation.py::measure_saved_tensors
+@ def measure_saved_tensors( | Runs `fn` (a loss call) and reports every tensor autograd saved for backward. `exclude`: tensors that do not count (the inputs, which exist anyway).
+@ def pack(t: torch.Tensor) -> torch.Tensor: | `saved_tensors_hooks(pack, unpack)` calls `pack` for every tensor an operation saves. We record shape, dtype and storage size; storages are de-duplicated by data pointer (several saved views of one tensor count once).
+@ # Return a detached alias (same storage), not ``t`` itself: for tensors an | **The leak bug.** Returning `t` itself kept a reference cycle through C++ autograd nodes that Python's garbage collector cannot see: each call leaked ~4x the input of GPU memory, and later benchmark groups ran out of memory (38 false OOM rows in Sprint 3). Returning `t.detach()` (same memory, no autograd link) fixed it.
+@ with torch.autograd.graph.saved_tensors_hooks(pack, unpack): | The hooks are active only while `fn` runs.
+::end
 
 ::exec
 import torch

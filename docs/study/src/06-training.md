@@ -11,13 +11,31 @@ filters, deep supervision with 4 output levels), loss `0.33 * (Dice + CE + mL1-A
 summed over the levels by `DeepSupervisionLoss`, AdamW, AMP (fp16). Inputs are
 synthetic but learnable volumes, identical batches for every implementation.
 
-::code src/ace_bench/e2e.py::PaperLoss | The paper's combined loss; only the `impl` of the ACE term changes between runs. The ACE value is accumulated as a GPU tensor (a Python float would force a host sync every step).
+::walk src/ace_bench/e2e.py:128-173
+@ class PaperLoss(_Loss): | **The paper's combined loss** (upstream config `*l1ace_dice_ce.yaml`), one instance per deep-supervision call.
+@ self.dice = DiceLoss( | MONAI Dice with the paper's settings: one-hot target, softmax, squared denominator. (This Dice is what breaks `torch.compile` graphs, see below.)
+@ self.ace_sum = torch.zeros(())  # GPU tensor: no host sync inside the step | The ACE term is logged as a GPU tensor: converting it to a Python float inside the step (`float(ace)`) would force the CPU to wait for the GPU every call and distort the timing.
+@ def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor: | `0.33 · (Dice + CE + ACE)` on one output level. Only `impl` differs between the runs being compared; everything else (network, data, optimizer, seed) is identical.
+@ def _build(cfg: E2EConfig, impl: str, binning: Binning) -> tuple[Any, Any, Any, Any]: | **The network**: MONAI `SegResNetDS` with the paper's architecture (32 initial filters, 5 encoder stages, deep supervision depth 4: the decoder emits 4 outputs at 1, 1/2, 1/4, 1/8 resolution). `DeepSupervisionLoss` resizes the target to each output and sums the 4 losses with exponentially decreasing weights. AdamW as in the paper. The seed is fixed: every implementation starts from the same weights.
+::end
 
 Each training run happens in a fresh process, measures every step with CUDA events,
 and records loss, ACE term, step time and peak memory. Separate probes find the
 largest cubic patch that still fits in the 15 GB of the T4.
 
-::code src/ace_bench/e2e.py::_forward | Network + deep-supervision loss, optionally under `torch.compile` (the whole step's forward, so the network is compiled too).
+::walk src/ace_bench/e2e.py:178-209
+@ def _forward(model: Any, loss_fn: Any, mode: CompileMode) -> Forward: | The forward part of a training step as one function: network + all 4 deep-supervision losses.
+@ if mode == "none": | **Compile modes**: "none" = eager; "default" = `torch.compile` (TorchDynamo traces the Python code into graphs, Inductor generates fused kernels); "reduce-overhead" adds CUDA graphs. The function is compiled as a whole, so the network gets compiled too.
+@ def _autocast(cfg: E2EConfig) -> Any: | **AMP**: inside `autocast`, convolutions and matmuls run in fp16, so the logits reaching the loss are fp16 (our kernels read them natively).
+@ def _step( | **One training step**: zero gradients, forward under autocast, backward with the gradient scaler (fp16 gradients are scaled up to avoid underflow), optimizer step. Returns the loss as a GPU tensor.
+::end
+
+::walk src/ace_bench/e2e.py:213-247
+@ def train_curve( | **One training run** in a fresh process (the parent starts a worker per implementation, like the benchmark harness).
+@ for step in range(cfg.steps): | `synthetic_batch(step)` is deterministic per step: every implementation trains on exactly the same sequence of volumes.
+@ if cfg.device == "cuda": | **Per-step measurement**: synchronize, reset the peak-memory counter, time the step with CUDA events, synchronize again. The first 5 steps (compilation, autotuning, cuDNN selection) are excluded from the medians in the report.
+@ rows.append( | One row per step: total loss, the ACE part, time, peak memory; written to `steps.parquet` for the curves and tables.
+::end
 
 ## Concept: Amdahl's law
 
