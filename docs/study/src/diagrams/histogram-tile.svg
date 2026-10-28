@@ -1,0 +1,25 @@
+<svg viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, Segoe UI, sans-serif" font-size="12" role="img" aria-label="One Triton program reduces a block of voxels into a private histogram">
+<style>
+.b{fill:var(--surface);stroke:var(--line);stroke-width:1.2}.k{fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.2}
+.on{fill:var(--accent)}.t{fill:var(--ink)}.s{fill:var(--ink-2);font-size:11px}.h{fill:var(--ink);font-weight:700}
+.a{stroke:var(--muted);stroke-width:1.5;fill:none;marker-end:url(#ar2)}
+</style>
+<defs><marker id="ar2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--muted)"/></marker></defs>
+<text class="h" x="20" y="24">1. load BLOCK voxels (p, y)</text>
+<g transform="translate(20,36)"><rect class="b" x="0" y="0" width="200" height="22"/><text class="s" x="6" y="15">p: .07 .93 .12 .55 .08 .97 ...</text>
+<rect class="b" x="0" y="28" width="200" height="22"/><text class="s" x="6" y="43">bin: 1  18  2  11  1  19 ...</text></g>
+<text class="h" x="270" y="24">2. one-hot [BLOCK, K] in registers</text>
+<g transform="translate(270,36)">
+<rect class="b" x="0" y="0" width="220" height="132"/>
+<g>
+<rect class="on" x="12" y="8" width="10" height="10"/><rect class="on" x="190" y="24" width="10" height="10"/><rect class="on" x="22" y="40" width="10" height="10"/><rect class="on" x="112" y="56" width="10" height="10"/><rect class="on" x="12" y="72" width="10" height="10"/><rect class="on" x="200" y="88" width="10" height="10"/>
+</g><text class="s" x="8" y="122">rows = voxels, columns = K bins</text></g>
+<text class="h" x="540" y="24">3. tl.sum over voxels: private histogram</text>
+<g transform="translate(540,36)"><rect class="k" x="0" y="0" width="200" height="60"/><text class="s" x="8" y="20">count[k]  = sum hit</text><text class="s" x="8" y="36">sum_p[k] = sum hit * p</text><text class="s" x="8" y="52">sum_y[k] = sum hit * y</text></g>
+<text class="h" x="540" y="130">4. ONE atomic_add per bin per block</text>
+<g transform="translate(540,140)"><rect class="b" x="0" y="0" width="200" height="40"/><text class="s" x="8" y="24">global [3, B, C, K] histogram</text></g>
+<path class="a" d="M225,58 H265"/><path class="a" d="M495,70 H535"/><path class="a" d="M640,100 V136"/>
+<text class="t" x="20" y="230">Original: every voxel does an atomic add into one of K=20 addresses: millions of threads collide (84% of its time).</text>
+<text class="t" x="20" y="252">Here: atomics per slice drop from N to 3 K N / BLOCK (e.g. 2M -> 15k), and the heavy work is register arithmetic.</text>
+<text class="s" x="20" y="276">Source: kernels/hard_hist.py::_hard_hist_kernel (soft: the same with two weighted bins per voxel).</text>
+</svg>

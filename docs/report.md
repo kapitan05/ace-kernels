@@ -53,6 +53,10 @@ Sprint 11; full table: `docs/ablation/ablation.md`):
   tensor-core variant), then the full paper replication (calibration metrics,
   reliability diagrams, seeds). Kaggle T4 has no `ncu` (hardware counters blocked).
 
+**Study guide.** `docs/study/index.html` (open in a browser): every sprint, concept and
+kernel explained with the real code, worked examples, evidence figures and self-checks;
+rebuild with `uv run python -m ace_bench.figures && uv run python -m ace_bench.study`.
+
 **How to read this repo.** Sprints are tagged (`git diff sprint-N sprint-M`); each
 section below has done / results / findings; raw runs in `results/kaggle/<commit>-*`,
 mirrored to W&B project `ace-kernels`.

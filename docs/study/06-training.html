@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6. Training: end-to-end, torch.compile | ACE kernels study</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/pygments.css">
+</head><body>
+<aside class="side"><a class="brand" href="index.html">mL1-ACE kernels<br>
+<small>study guide</small></a><ol class="pages"><li class=""><a href="index.html">Overview: map of the project</a></li><li class=""><a href="01-loss.html">1. The loss and why the original is slow</a></li><li class=""><a href="02-correctness.html">2. Proving &#x27;same as the original&#x27;</a></li><li class=""><a href="03-pytorch.html">3. PyTorch: vectorize, handwritten backward</a></li><li class=""><a href="04-triton.html">4. Triton kernels</a></li><li class=""><a href="05-sprint11.html">5. Sprint 11: launches, index, packaging</a></li><li class="current"><a href="06-training.html">6. Training: end-to-end, torch.compile</a></li><li class=""><a href="07-tooling.html">7. Tooling: bench, Kaggle, W&amp;B, profiler</a></li><li class=""><a href="evidence.html">Evidence: claim -&gt; proof</a></li><li class=""><a href="glossary.html">Glossary</a></li></ol>
+<div class="toc"><b>On this page</b><ul><li><a href="#the-end-to-end-harness">The end-to-end harness</a></li><li><a href="#concept-amdahls-law">Concept: Amdahl's law</a></li><li><a href="#torchcompile-vs-our-kernels">torch.compile vs our kernels</a></li><li><a href="#is-training-unchanged-the-control-run">Is training unchanged? The control run</a></li><li><a href="#larger-patches-fit">Larger patches fit</a></li><li><a href="#try-it">Try it</a></li></ul></div>
+<p class="meta">commit b407b4727f</p></aside>
+<main><p class="sprints">Sprints: S8, S11</p><h1 id="6-training-the-loss-inside-the-real-step-and-torchcompile">6. Training: the loss inside the real step, and torch.compile</h1>
+<p>A 30-75x faster loss does not make training 30-75x faster. This page measures the loss
+inside the paper's actual training step and explains the numbers, including how our
+kernels and <code>torch.compile</code> combine.</p>
+<h2 id="the-end-to-end-harness">The end-to-end harness</h2>
+<p><code>ace_bench/e2e.py</code> rebuilds the paper's training setup: MONAI <code>SegResNetDS</code> (32
+filters, deep supervision with 4 output levels), loss <code>0.33 * (Dice + CE + mL1-ACE)</code>
+summed over the levels by <code>DeepSupervisionLoss</code>, AdamW, AMP (fp16). Inputs are
+synthetic but learnable volumes, identical batches for every implementation.</p>
+<figure class="code"><div class="code-head"><span class="path">src/ace_bench/e2e.py:128-152</span><a href="https://github.com/kapitan05/ace-kernels/blob/b407b4727fb5e70160d718f64cf7debc8ea716c3/src/ace_bench/e2e.py#L128-L152" target="_blank" rel="noopener">GitHub</a></div><div class="highlight"><pre><span></span><span class="linenos">128</span><span class="k">class</span><span class="w"> </span><span class="nc">PaperLoss</span><span class="p">(</span><span class="n">_Loss</span><span class="p">):</span>
+<span class="linenos">129</span><span class="w">    </span><span class="sd">"""0.33 * (Dice + CE + mL1-ACE), as ``*l1ace_dice_ce.yaml`` upstream."""</span>
+<span class="linenos">130</span>
+<span class="linenos">131</span>    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">impl</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">binning</span><span class="p">:</span> <span class="n">Binning</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos">132</span>        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+<span class="linenos">133</span>        <span class="kn">from</span><span class="w"> </span><span class="nn">monai.losses.dice</span><span class="w"> </span><span class="kn">import</span> <span class="n">DiceLoss</span>
+<span class="linenos">134</span>
+<span class="linenos">135</span>        <span class="bp">self</span><span class="o">.</span><span class="n">impl</span> <span class="o">=</span> <span class="n">impl</span>
+<span class="linenos">136</span>        <span class="bp">self</span><span class="o">.</span><span class="n">ace_config</span> <span class="o">=</span> <span class="n">ACEConfig</span><span class="p">(</span><span class="n">binning</span><span class="o">=</span><span class="n">binning</span><span class="p">,</span> <span class="n">to_onehot_y</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos">137</span>        <span class="bp">self</span><span class="o">.</span><span class="n">dice</span> <span class="o">=</span> <span class="n">DiceLoss</span><span class="p">(</span>
+<span class="linenos">138</span>            <span class="n">to_onehot_y</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="linenos">139</span>            <span class="n">softmax</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="linenos">140</span>            <span class="n">squared_pred</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="linenos">141</span>            <span class="n">smooth_nr</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+<span class="linenos">142</span>            <span class="n">smooth_dr</span><span class="o">=</span><span class="mf">1e-5</span><span class="p">,</span>
+<span class="linenos">143</span>        <span class="p">)</span>
+<span class="linenos">144</span>        <span class="bp">self</span><span class="o">.</span><span class="n">ace_sum</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(())</span>  <span class="c1"># GPU tensor: no host sync inside the step</span>
+<span class="linenos">145</span>
+<span class="linenos">146</span>    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">logits</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">labels</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="linenos">147</span>        <span class="n">ce</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">cross_entropy</span><span class="p">(</span><span class="n">logits</span><span class="o">.</span><span class="n">float</span><span class="p">(),</span> <span class="n">labels</span><span class="p">[:,</span> <span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">long</span><span class="p">())</span>
+<span class="linenos">148</span>        <span class="n">ace</span> <span class="o">=</span> <span class="n">ace_loss</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="n">labels</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">ace_config</span><span class="p">,</span> <span class="n">impl</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">impl</span><span class="p">)</span>
+<span class="linenos">149</span>        <span class="c1"># summed over deep-supervision levels; read after the timed step</span>
+<span class="linenos">150</span>        <span class="bp">self</span><span class="o">.</span><span class="n">ace_sum</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">ace_sum</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">ace</span><span class="o">.</span><span class="n">device</span><span class="p">)</span> <span class="o">+</span> <span class="n">ace</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">float</span><span class="p">()</span>
+<span class="linenos">151</span>        <span class="n">loss</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="mf">0.33</span> <span class="o">*</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">dice</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="n">labels</span><span class="p">)</span> <span class="o">+</span> <span class="n">ce</span> <span class="o">+</span> <span class="n">ace</span><span class="p">)</span>
+<span class="linenos">152</span>        <span class="k">return</span> <span class="n">loss</span>
+</pre></div>
+<p class="code-note">The paper's combined loss; only the <code>impl</code> of the ACE term changes between runs. The ACE value is accumulated as a GPU tensor (a Python float would force a host sync every step).</p></figure>
+<p>Each training run happens in a fresh process, measures every step with CUDA events,
+and records loss, ACE term, step time and peak memory. Separate probes find the
+largest cubic patch that still fits in the 15 GB of the T4.</p>
+<figure class="code"><div class="code-head"><span class="path">src/ace_bench/e2e.py:178-188</span><a href="https://github.com/kapitan05/ace-kernels/blob/b407b4727fb5e70160d718f64cf7debc8ea716c3/src/ace_bench/e2e.py#L178-L188" target="_blank" rel="noopener">GitHub</a></div><div class="highlight"><pre><span></span><span class="linenos">178</span><span class="k">def</span><span class="w"> </span><span class="nf">_forward</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">Any</span><span class="p">,</span> <span class="n">loss_fn</span><span class="p">:</span> <span class="n">Any</span><span class="p">,</span> <span class="n">mode</span><span class="p">:</span> <span class="n">CompileMode</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Forward</span><span class="p">:</span>
+<span class="linenos">179</span><span class="w">    </span><span class="sd">"""Network + deep-supervision loss, optionally under ``torch.compile``."""</span>
+<span class="linenos">180</span>
+<span class="linenos">181</span>    <span class="k">def</span><span class="w"> </span><span class="nf">fwd</span><span class="p">(</span><span class="n">image</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">labels</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="linenos">182</span>        <span class="n">loss</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="n">loss_fn</span><span class="p">(</span><span class="n">model</span><span class="p">(</span><span class="n">image</span><span class="p">),</span> <span class="n">labels</span><span class="p">)</span>
+<span class="linenos">183</span>        <span class="k">return</span> <span class="n">loss</span>
+<span class="linenos">184</span>
+<span class="linenos">185</span>    <span class="k">if</span> <span class="n">mode</span> <span class="o">==</span> <span class="s2">"none"</span><span class="p">:</span>
+<span class="linenos">186</span>        <span class="k">return</span> <span class="n">fwd</span>
+<span class="linenos">187</span>    <span class="n">compiled</span><span class="p">:</span> <span class="n">Forward</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">fwd</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="kc">None</span> <span class="k">if</span> <span class="n">mode</span> <span class="o">==</span> <span class="s2">"default"</span> <span class="k">else</span> <span class="n">mode</span><span class="p">)</span>
+<span class="linenos">188</span>    <span class="k">return</span> <span class="n">compiled</span>
+</pre></div>
+<p class="code-note">Network + deep-supervision loss, optionally under <code>torch.compile</code> (the whole step's forward, so the network is compiled too).</p></figure>
+<h2 id="concept-amdahls-law">Concept: Amdahl's law</h2>
+<p>If a part takes a fraction <code>s</code> of the step and becomes <code>x</code> times faster, the step
+becomes <code>1 / ((1 - s) + s / x)</code> times faster. With the loss at 10-19% of the original
+step and 30x faster: <code>1 / (0.85 + 0.15/30) = 1.17x</code>. That is what we measure:</p>
+<figure class="plot"><img src="assets/plots/docs_study_assets_figures_training-step.png" alt="Median training-step time: original vs ours, eager vs torch.compile (T4, 128^3, AMP)" loading="lazy"><figcaption>Median training-step time: original vs ours, eager vs torch.compile (T4, 128^3, AMP) <span class="src">docs/study/assets/figures/training-step.png</span></figcaption><p class="proves"><b>Proves:</b> our kernels speed up the loss part; compile speeds up mainly the network; for hard binning the two add up (472 ms), for soft compile already fuses the original's loss well.</p></figure>
+<h2 id="torchcompile-vs-our-kernels">torch.compile vs our kernels</h2>
+<p>All four numbers are relative to the same baseline: the original loss, no compile.
+"+ compile" compiles <strong>network and loss together</strong>, so it includes compile's gains on
+the network, which our work does not touch:</p>
+<figure class="table"><div class="scroll"><table><thead><tr><th>binning</th><th>impl</th><th>median step ms</th><th>peak MiB</th></tr></thead><tbody><tr><td>hard</td><td>reference</td><td>585.7</td><td>3606.0</td></tr><tr><td>hard</td><td>v6_triton</td><td>534.0</td><td>3607.0</td></tr><tr><td>hard</td><td>reference +default</td><td>529.4</td><td>3496.0</td></tr><tr><td>hard</td><td>v5_triton</td><td>528.7</td><td>3607.0</td></tr><tr><td>hard</td><td>v5_triton +default</td><td>472.5</td><td>3496.0</td></tr><tr><td>hard</td><td>v6_triton +default</td><td>472.3</td><td>3496.0</td></tr><tr><td>soft</td><td>reference</td><td>654.6</td><td>3647.0</td></tr><tr><td>soft</td><td>v5_triton</td><td>537.1</td><td>3607.0</td></tr><tr><td>soft</td><td>v6_triton</td><td>533.2</td><td>3607.0</td></tr><tr><td>soft</td><td>reference +default</td><td>476.9</td><td>3498.0</td></tr><tr><td>soft</td><td>v6_triton +default</td><td>476.0</td><td>3496.0</td></tr><tr><td>soft</td><td>v5_triton +default</td><td>472.6</td><td>3496.0</td></tr></tbody></table></div><figcaption>Sprint 11 end-to-end run, T4: "+default" = torch.compile (default mode) of the whole forward. <span class="src">results/kaggle/60a3c6df2c3c-run-sprint11/results/20261027T150917Z-sprint11-e2e/steps.parquet</span></figcaption></figure>
+<p>How to read it:</p>
+<ul>
+<li><strong>Ours alone (eager)</strong> replaces only the loss: 1.10x (hard) / 1.23x (soft), capped by
+  the loss's share of the step.</li>
+<li><strong>Compile alone</strong> speeds up mainly the network (it fuses norm + activation layers),
+  plus some of the loss: 1.11x / 1.37x.</li>
+<li><strong>Hard: the gains add up.</strong> Compile saves ~56 ms (network), our kernels ~52 ms
+  (loss); together ~113 ms (1.24x). They act on different parts.</li>
+<li><strong>Soft: they do not.</strong> Compile already makes the original soft loss much faster
+  (Sprint 2: 4.7x in isolation), so after compiling, the soft loss is a small share and
+  our kernels add ~1 ms. Open question: in isolation the compiled original soft loss
+  is still ~8x slower than ours (39 vs 5 ms), which predicts a ~15 ms gap per step;
+  measured ~1 ms. Candidates: fp16 logits under AMP, overlap inside the compiled graph,
+  single-run noise. Profiling the loss inside the compiled step would settle it.</li>
+</ul>
+<p>What compile does <strong>not</strong> give, and ours does:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>original + compile</th>
+<th>ours</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>peak memory of the loss (kits23 soft)</td>
+<td>688 MiB</td>
+<td>64 MiB</td>
+</tr>
+<tr>
+<td>16 classes, soft (amos22)</td>
+<td>2694 ms (2x <em>slower</em> than eager)</td>
+<td>20 ms</td>
+</tr>
+<tr>
+<td>warm-up</td>
+<td>seconds of compilation, recompiles on new shapes</td>
+<td>none</td>
+</tr>
+<tr>
+<td>users who train eagerly</td>
+<td>no gain</td>
+<td>full gain</td>
+</tr>
+</tbody>
+</table>
+<p>And the graph breaks (<code>torch._dynamo.explain</code>): the 8 breaks per step come from MONAI's
+<code>DiceLoss</code> (<code>torch.arange(...).tolist()</code>, 2 per level), for every ACE implementation.
+The original ACE loss itself traces fine; v5 added 6 breaks; v6 (custom ops) adds 0:</p>
+<figure class="table"><div class="scroll"><table><thead><tr><th>impl</th><th>binning</th><th>graphs</th><th>graph_breaks</th><th>reasons</th></tr></thead><tbody><tr><td>reference</td><td>hard</td><td>9</td><td>8</td><td>Data dependent operator</td></tr><tr><td>v5_triton</td><td>hard</td><td>15</td><td>14</td><td>Attempted to use tensor creation function with requires_grad=True; Data dependent operator; using `torch.autograd.grad` with `torch._dynamo.config.trace_autograd_ops=False`</td></tr><tr><td>v6_triton</td><td>hard</td><td>9</td><td>8</td><td>Data dependent operator</td></tr><tr><td>reference</td><td>soft</td><td>9</td><td>8</td><td>Data dependent operator</td></tr><tr><td>v5_triton</td><td>soft</td><td>15</td><td>14</td><td>Attempted to use tensor creation function with requires_grad=True; Data dependent operator; using `torch.autograd.grad` with `torch._dynamo.config.trace_autograd_ops=False`</td></tr><tr><td>v6_triton</td><td>soft</td><td>9</td><td>8</td><td>Data dependent operator</td></tr></tbody></table></div><figcaption>Graph breaks of network + loss under torch.compile. <span class="src">results/kaggle/60a3c6df2c3c-run-sprint11/results/20261027T150917Z-sprint11-e2e/compile.parquet</span></figcaption></figure>
+<h2 id="is-training-unchanged-the-control-run">Is training unchanged? The control run</h2>
+<p>The loss curves of ours and the original differ by a few percent after a few dozen
+steps. Is that a bug? The <strong>control</strong> answers it: the original trained twice with the
+same seed and batches also diverges, because cuDNN convolutions, atomics and AMP are
+not bit-deterministic and training amplifies tiny differences:</p>
+<figure class="plot"><img src="assets/plots/results_kaggle_60a3c6df2c3c-run-sprint11_results_20261027T150917Z-sprint11-e2e_plots_e2e-soft.png" alt="Soft binning: loss curves (left) and step times (right); "rerun" = the original again" loading="lazy"><figcaption>Soft binning: loss curves (left) and step times (right); "rerun" = the original again <span class="src">results/kaggle/60a3c6df2c3c-run-sprint11/results/20261027T150917Z-sprint11-e2e/plots/e2e-soft.png</span></figcaption><p class="proves"><b>Proves:</b> ours stays within the original's own run-to-run spread (rerun max difference 18%, ours 4.6%); step 0 is identical (8e-8), i.e. the forward is exact.</p></figure>
+<h2 id="larger-patches-fit">Larger patches fit</h2>
+<figure class="table"><div class="scroll"><table><thead><tr><th>impl</th><th>binning</th><th>patch</th><th>status</th><th>peak MiB</th></tr></thead><tbody><tr><td>reference</td><td>hard</td><td>208</td><td>ok</td><td>11601.0</td></tr><tr><td>reference</td><td>hard</td><td>224</td><td>oom</td><td></td></tr><tr><td>v5_triton</td><td>hard</td><td>208</td><td>ok</td><td>11601.0</td></tr><tr><td>v5_triton</td><td>hard</td><td>224</td><td>ok</td><td>14189.0</td></tr><tr><td>v5_triton</td><td>hard</td><td>240</td><td>oom</td><td></td></tr><tr><td>v6_triton</td><td>hard</td><td>208</td><td>ok</td><td>11601.0</td></tr><tr><td>v6_triton</td><td>hard</td><td>224</td><td>ok</td><td>14189.0</td></tr><tr><td>v6_triton</td><td>hard</td><td>240</td><td>oom</td><td></td></tr><tr><td>reference</td><td>soft</td><td>208</td><td>ok</td><td>11756.0</td></tr><tr><td>reference</td><td>soft</td><td>224</td><td>ok</td><td>14378.0</td></tr><tr><td>reference</td><td>soft</td><td>240</td><td>oom</td><td></td></tr><tr><td>v5_triton</td><td>soft</td><td>208</td><td>ok</td><td>11601.0</td></tr><tr><td>v5_triton</td><td>soft</td><td>224</td><td>ok</td><td>14189.0</td></tr><tr><td>v5_triton</td><td>soft</td><td>240</td><td>oom</td><td></td></tr><tr><td>v6_triton</td><td>soft</td><td>208</td><td>ok</td><td>11601.0</td></tr><tr><td>v6_triton</td><td>soft</td><td>224</td><td>ok</td><td>14189.0</td></tr><tr><td>v6_triton</td><td>soft</td><td>240</td><td>oom</td><td></td></tr></tbody></table></div><figcaption>Largest cubic patch probe (two training steps, 15 GB T4): hard binning, the original stops at 208^3, ours fits 224^3. <span class="src">results/kaggle/60a3c6df2c3c-run-sprint11/results/20261027T150917Z-sprint11-e2e/probes.parquet</span></figcaption></figure>
+<h2 id="try-it">Try it</h2>
+<div class="run"><button class="copy" type="button">copy</button><pre><code>$ uv run python -m ace_bench.e2e bench/configs/e2e_cpu_smoke.yaml</code></pre><p class="expect">a tiny CPU version of the whole pipeline (curves, probes, compile, summary) in ~1 minute; not a result, a pipeline check</p></div>
+<details class="check"><summary>Self-check: The loss is 30x faster but the step only 1.1-1.2x. Where is the rest of the time?</summary><div class="answer">In the network (SegResNetDS forward + backward, ~80-90% of the original step). Amdahl: 1 / (0.85 + 0.15/30) ~ 1.17.</div></details>
+<details class="check"><summary>Self-check: Why is a reference-vs-reference control run needed?</summary><div class="answer">Training on a GPU is not bit-deterministic (cuDNN algorithms, atomics, AMP). Without knowing how much the original differs from itself, a difference between ours and the original cannot be attributed to our code.</div></details>
+<details class="check"><summary>Self-check: Should a user compile, or use our kernels?</summary><div class="answer">Both: they speed up different parts. Our kernels also bring memory savings, many-class speed and eager-mode gains that compile does not.</div></details>
+<nav class="pager"><a href="05-sprint11.html">&larr; 5. Sprint 11: launches, index, packaging</a><a href="07-tooling.html">7. Tooling: bench, Kaggle, W&B, profiler &rarr;</a></nav></main>
+<script src="assets/study.js"></script></body></html>

@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Overview: map of the project | ACE kernels study</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/pygments.css">
+</head><body>
+<aside class="side"><a class="brand" href="index.html">mL1-ACE kernels<br>
+<small>study guide</small></a><ol class="pages"><li class="current"><a href="index.html">Overview: map of the project</a></li><li class=""><a href="01-loss.html">1. The loss and why the original is slow</a></li><li class=""><a href="02-correctness.html">2. Proving &#x27;same as the original&#x27;</a></li><li class=""><a href="03-pytorch.html">3. PyTorch: vectorize, handwritten backward</a></li><li class=""><a href="04-triton.html">4. Triton kernels</a></li><li class=""><a href="05-sprint11.html">5. Sprint 11: launches, index, packaging</a></li><li class=""><a href="06-training.html">6. Training: end-to-end, torch.compile</a></li><li class=""><a href="07-tooling.html">7. Tooling: bench, Kaggle, W&amp;B, profiler</a></li><li class=""><a href="evidence.html">Evidence: claim -&gt; proof</a></li><li class=""><a href="glossary.html">Glossary</a></li></ol>
+<div class="toc"><b>On this page</b><ul><li><a href="#how-to-use-this-guide">How to use this guide</a></li><li><a href="#map-of-the-repository">Map of the repository</a></li><li><a href="#the-deliverable-and-its-data-flow">The deliverable and its data flow</a></li><li><a href="#the-ladder-at-a-glance">The ladder at a glance</a></li><li><a href="#sessions">Sessions</a></li></ul></div>
+<p class="meta">commit b407b4727f</p></aside>
+<main><p class="sprints">Sprints: all</p><h1 id="study-guide-making-the-ml1-ace-loss-fast-on-the-gpu">Study guide: making the mL1-ACE loss fast on the GPU</h1>
+<p>This guide teaches the whole project: the loss, why the original implementation is
+slow, every optimization step (sprints 1-11), how each step is <strong>proven</strong> correct and
+measured, and the tooling around it. Every code block on these pages is cut from the
+repository at build time, and every table is read from a saved benchmark run, so
+what you read is what the code does.</p>
+<blockquote>
+<p><strong>Result in one line.</strong> Our implementation computes the same loss and gradients as
+the original, 29-75x faster and with 5-14x less peak memory on a Tesla T4 (paper
+training shapes), and is a drop-in replacement:
+<code>from ace_kernels.module import HardL1ACELoss, SoftL1ACELoss</code>.</p>
+</blockquote>
+<h2 id="how-to-use-this-guide">How to use this guide</h2>
+<p>Read the pages in order; each one follows the same pattern:</p>
+<ol>
+<li><strong>Concept</strong>: the idea in plain words.</li>
+<li><strong>Code</strong>: the real implementation, with the lines that matter pointed out.</li>
+<li><strong>Worked example</strong>: small numbers computed by actually running the code.</li>
+<li><strong>Try it</strong>: commands for your Mac (tests, CPU runs). Copy button on the right.</li>
+<li><strong>Evidence</strong>: the plot or table from a GPU run that proves the claim.</li>
+<li><strong>Self-check</strong>: questions with hidden answers. Answer before you open them.</li>
+</ol>
+<p>GPU numbers come from Kaggle Tesla T4 runs stored in <code>results/kaggle/&lt;commit&gt;-&lt;job&gt;/</code>;
+you do not need a GPU to study them. Rebuild this guide any time:</p>
+<div class="run"><button class="copy" type="button">copy</button><pre><code>$ uv run python -m ace_bench.figures &amp;&amp; uv run python -m ace_bench.study</code></pre><p class="expect">writes docs/study/*.html; then open docs/study/index.html</p></div>
+<h2 id="map-of-the-repository">Map of the repository</h2>
+<figure class="diagram"><svg viewBox="0 0 900 430" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, Segoe UI, sans-serif" font-size="13" role="img" aria-label="Architecture of the repository">
+<style>
+.b{fill:var(--surface);stroke:var(--line);stroke-width:1.5;rx:8}
+.k{fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.5}
+.t{fill:var(--ink)} .s{fill:var(--ink-2);font-size:11px} .h{fill:var(--ink);font-weight:700}
+.a{stroke:var(--muted);stroke-width:1.5;fill:none;marker-end:url(#ar)}
+</style>
+<defs><marker id="ar" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--muted)"/></marker></defs>
+<rect class="b" x="20" y="20" width="250" height="70" rx="8"/><text class="h" x="35" y="45">ace_reference/</text><text class="s" x="35" y="65">upstream loss, frozen (SHA test)</text><text class="s" x="35" y="80">= ground truth</text>
+<rect class="b" x="20" y="120" width="250" height="110" rx="8"/><text class="h" x="35" y="145">ace_kernels/ core</text><text class="s" x="35" y="165">config.py   ACEConfig (all options)</text><text class="s" x="35" y="182">common.py   prepare, edges, reduce</text><text class="s" x="35" y="199">binning.py  BinStats math (torch)</text><text class="s" x="35" y="216">registry.py name -> implementation</text>
+<rect class="k" x="310" y="20" width="270" height="210" rx="8"/><text class="h" x="325" y="45">impls/  the ladder (1 change each)</text>
+<text class="s" x="325" y="68">reference, baselines (compile, ckpt)   S2</text><text class="s" x="325" y="88">v1_vectorized -> v1_clean              S3</text><text class="s" x="325" y="108">v2_autograd (handwritten bwd)         S4</text><text class="s" x="325" y="128">v3_triton -> v4_triton             S5-S7</text><text class="s" x="325" y="148">v5_triton (fused softmax)             S8</text><text class="s" x="325" y="168">v6_index -> v6_triton -> v6_precise  S11</text><text class="s" x="325" y="188">v6_dot (side branch, tensor cores)  S11</text><text class="s" x="325" y="214">all call into kernels/ (v3+)</text>
+<rect class="k" x="620" y="20" width="260" height="210" rx="8"/><text class="h" x="635" y="45">kernels/  Triton (GPU)</text><text class="s" x="635" y="68">act.py        softmax / exp in registers</text><text class="s" x="635" y="88">bins.py       O(1) index, dot reduction</text><text class="s" x="635" y="108">hard_hist.py  private histograms</text><text class="s" x="635" y="128">soft_hist.py  2-bin interpolation</text><text class="s" x="635" y="148">hard_bwd.py   gradient in 1 pass</text><text class="s" x="635" y="168">soft_bwd.py   gradient in 1 pass</text><text class="s" x="635" y="188">epilogue.py   per-bin -> loss, 1 launch</text>
+<rect class="k" x="310" y="260" width="270" height="60" rx="8"/><text class="h" x="325" y="285">module.py  (the deliverable)</text><text class="s" x="325" y="305">HardL1ACELoss / SoftL1ACELoss drop-ins</text>
+<rect class="b" x="20" y="260" width="250" height="150" rx="8"/><text class="h" x="35" y="285">tests/</text><text class="s" x="35" y="305">golden, oracle (float64), equivalence</text><text class="s" x="35" y="322">v2 (gradcheck), triton, module</text><text class="s" x="35" y="339">sync / CUDA graphs, saved tensors</text><text class="s" x="35" y="356">study (this guide)</text><text class="s" x="35" y="385">gate: must pass before any benchmark</text>
+<rect class="b" x="620" y="260" width="260" height="150" rx="8"/><text class="h" x="635" y="285">ace_bench/  measurement</text><text class="s" x="635" y="305">run / measure / timing / calculator</text><text class="s" x="635" y="322">profile, e2e (training), ablation</text><text class="s" x="635" y="339">remote (Kaggle), tracking (W&amp;B)</text><text class="s" x="635" y="356">report, figures, study</text><text class="s" x="635" y="385">-> results/, docs/, W&amp;B</text>
+<path class="a" d="M270,55 H305"/><path class="a" d="M270,175 H305"/><path class="a" d="M580,125 H615"/><path class="a" d="M445,230 V255"/><path class="a" d="M145,255 V235"/><path class="a" d="M750,255 V235"/>
+</svg>
+</figure>
+<p>Five parts, each with one job:</p>
+<table>
+<thead>
+<tr>
+<th>part</th>
+<th>job</th>
+<th>read first</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>src/ace_reference/</code></td>
+<td>the upstream loss, frozen: the ground truth</td>
+<td><code>hardl1ace.py</code></td>
+</tr>
+<tr>
+<td><code>src/ace_kernels/</code> core</td>
+<td>options, shared semantics, the math in PyTorch</td>
+<td><code>config.py</code>, <code>binning.py</code></td>
+</tr>
+<tr>
+<td><code>src/ace_kernels/impls/</code></td>
+<td>the optimization ladder, one change per entry</td>
+<td>page 3-5</td>
+</tr>
+<tr>
+<td><code>src/ace_kernels/kernels/</code></td>
+<td>Triton GPU kernels</td>
+<td>page 4-5</td>
+</tr>
+<tr>
+<td><code>src/ace_bench/</code> + <code>tests/</code></td>
+<td>measuring and proving</td>
+<td>page 2, 7</td>
+</tr>
+</tbody>
+</table>
+<p>Every implementation is registered under a name and called the same way, which is
+what makes the ladder comparable step by step:</p>
+<figure class="code"><div class="code-head"><span class="path">src/ace_kernels/registry.py:78-100</span><a href="https://github.com/kapitan05/ace-kernels/blob/b407b4727fb5e70160d718f64cf7debc8ea716c3/src/ace_kernels/registry.py#L78-L100" target="_blank" rel="noopener">GitHub</a></div><div class="highlight"><pre><span></span><span class="linenos"> 78</span><span class="k">def</span><span class="w"> </span><span class="nf">ace_loss</span><span class="p">(</span>
+<span class="linenos"> 79</span>    <span class="nb">input</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+<span class="linenos"> 80</span>    <span class="n">target</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+<span class="linenos"> 81</span>    <span class="n">config</span><span class="p">:</span> <span class="n">ACEConfig</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<span class="linenos"> 82</span>    <span class="n">impl</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"reference"</span><span class="p">,</span>
+<span class="linenos"> 83</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="linenos"> 84</span><span class="w">    </span><span class="sd">"""Compute the mL1-ACE loss with the chosen implementation.</span>
+<span class="linenos"> 85</span>
+<span class="linenos"> 86</span><span class="sd">    Args:</span>
+<span class="linenos"> 87</span><span class="sd">        input: logits or probabilities, shape ``[B, C, *spatial]``.</span>
+<span class="linenos"> 88</span><span class="sd">        target: one-hot ``[B, C, *spatial]``, or labels ``[B, 1, *spatial]``</span>
+<span class="linenos"> 89</span><span class="sd">            when ``config.to_onehot_y`` is set.</span>
+<span class="linenos"> 90</span><span class="sd">        config: loss options; defaults to ``ACEConfig()``.</span>
+<span class="linenos"> 91</span><span class="sd">        impl: registered implementation name.</span>
+<span class="linenos"> 92</span><span class="sd">    """</span>
+<span class="linenos"> 93</span>    <span class="n">config</span> <span class="o">=</span> <span class="n">config</span> <span class="k">if</span> <span class="n">config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">ACEConfig</span><span class="p">()</span>
+<span class="linenos"> 94</span>    <span class="n">spec</span> <span class="o">=</span> <span class="n">get_impl</span><span class="p">(</span><span class="n">impl</span><span class="p">)</span>
+<span class="linenos"> 95</span>    <span class="k">if</span> <span class="ow">not</span> <span class="n">spec</span><span class="o">.</span><span class="n">supports</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">binning</span><span class="p">,</span> <span class="nb">input</span><span class="o">.</span><span class="n">device</span><span class="o">.</span><span class="n">type</span><span class="p">):</span>
+<span class="linenos"> 96</span>        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+<span class="linenos"> 97</span>            <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">impl</span><span class="si">!r}</span><span class="s2"> does not support binning=</span><span class="si">{</span><span class="n">config</span><span class="o">.</span><span class="n">binning</span><span class="si">!r}</span><span class="s2"> "</span>
+<span class="linenos"> 98</span>            <span class="sa">f</span><span class="s2">"on device=</span><span class="si">{</span><span class="nb">input</span><span class="o">.</span><span class="n">device</span><span class="o">.</span><span class="n">type</span><span class="si">!r}</span><span class="s2">"</span>
+<span class="linenos"> 99</span>        <span class="p">)</span>
+<span class="linenos">100</span>    <span class="k">return</span> <span class="n">spec</span><span class="o">.</span><span class="n">fn</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">target</span><span class="p">,</span> <span class="n">config</span><span class="p">)</span>
+</pre></div>
+<p class="code-note">One entry point for all implementations: same inputs, same config, only <code>impl</code> changes. Tests and benchmarks loop over the registry.</p></figure>
+<h2 id="the-deliverable-and-its-data-flow">The deliverable and its data flow</h2>
+<figure class="diagram"><svg viewBox="0 0 900 250" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, Segoe UI, sans-serif" font-size="12" role="img" aria-label="Data flow of the deliverable: forward and backward kernels">
+<style>.b{fill:var(--surface);stroke:var(--line);stroke-width:1.2}.k{fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.2}.h{fill:var(--ink);font-weight:700}.s{fill:var(--ink-2);font-size:11px}.a{stroke:var(--muted);stroke-width:1.5;fill:none;marker-end:url(#ar3)}</style>
+<defs><marker id="ar3" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--muted)"/></marker></defs>
+<text class="h" x="20" y="22">forward</text>
+<rect class="b" x="20" y="34" width="150" height="56"/><text class="h" x="30" y="56">module.forward</text><text class="s" x="30" y="74">logits [B,C,...], labels</text>
+<rect class="b" x="200" y="34" width="150" height="56"/><text class="h" x="210" y="56">ace_kernels::v6_forward</text><text class="s" x="210" y="74">torch.library op</text>
+<rect class="k" x="380" y="34" width="170" height="56"/><text class="h" x="390" y="56">_hard_hist_kernel</text><text class="s" x="390" y="74">softmax + bin + histogram</text>
+<rect class="k" x="580" y="34" width="150" height="56"/><text class="h" x="590" y="56">_epilogue_kernel</text><text class="s" x="590" y="74">d, coef, f, loss, jac</text>
+<rect class="b" x="760" y="34" width="120" height="56"/><text class="h" x="770" y="56">loss</text><text class="s" x="770" y="74">saves [B,C,K] only</text>
+<text class="h" x="20" y="140">backward</text>
+<rect class="b" x="200" y="152" width="150" height="56"/><text class="h" x="210" y="174">ace_kernels::v6_backward</text><text class="s" x="210" y="192">g = jac * grad_out</text>
+<rect class="k" x="380" y="152" width="170" height="56"/><text class="h" x="390" y="174">_hard_bwd_kernel</text><text class="s" x="390" y="192">recompute softmax + bin</text>
+<rect class="b" x="580" y="152" width="150" height="56"/><text class="h" x="590" y="174">d logits</text><text class="s" x="590" y="192">same dtype as logits</text>
+<path class="a" d="M170,62 H195"/><path class="a" d="M350,62 H375"/><path class="a" d="M550,62 H575"/><path class="a" d="M730,62 H755"/><path class="a" d="M350,180 H375"/><path class="a" d="M550,180 H575"/><path class="a" d="M820,90 V125 H275 V148"/>
+<text class="s" x="20" y="238">7 GPU launches per training call: zero-fill, hist, epilogue | grad seed, g, bwd (+1 reduction). The original: 428 (hard) to 3813 (soft, 16 classes).</text>
+</svg>
+</figure>
+<p>The user-facing class only translates the upstream constructor into an <code>ACEConfig</code>
+and picks the implementation for the device:</p>
+<figure class="code"><div class="code-head"><span class="path">src/ace_kernels/module.py:90-94</span><a href="https://github.com/kapitan05/ace-kernels/blob/b407b4727fb5e70160d718f64cf7debc8ea716c3/src/ace_kernels/module.py#L90-L94" target="_blank" rel="noopener">GitHub</a></div><div class="highlight"><pre><span></span><span class="linenos">90</span>    <span class="k">def</span><span class="w"> </span><span class="nf">resolve_impl</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="linenos">91</span><span class="w">        </span><span class="sd">"""Implementation used for inputs on ``device``."""</span>
+<span class="linenos">92</span>        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">impl</span> <span class="o">!=</span> <span class="s2">"auto"</span><span class="p">:</span>
+<span class="linenos">93</span>            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">impl</span>
+<span class="linenos">94</span>        <span class="k">return</span> <span class="n">FAST_CUDA</span> <span class="k">if</span> <span class="n">device</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="s2">"cuda"</span> <span class="ow">and</span> <span class="n">HAS_TRITON</span> <span class="k">else</span> <span class="n">FAST_OTHER</span>
+</pre></div>
+<p class="code-note">"auto": Triton on CUDA, the handwritten-backward PyTorch version elsewhere (CPU, Mac).</p></figure>
+<h2 id="the-ladder-at-a-glance">The ladder at a glance</h2>
+<p>Each row is one registry entry = one change, measured on the same GPU and input
+(kits23 shape: 2 volumes x 4 classes x 128^3, forward + backward):</p>
+<figure class="table"><div class="scroll"><table><thead><tr><th>impl</th><th>ms</th><th>% peak BW</th><th>peak MiB</th><th>kernels</th><th>run</th></tr></thead><tbody><tr><td>reference</td><td>99.8</td><td>0.8</td><td>320.0</td><td>428</td><td>20261027T151515Z-sprint11-precise</td></tr><tr><td>reference_checkpoint</td><td>168.6</td><td>0.5</td><td>320.0</td><td>675</td><td>20261025T195519Z-baseline-paper</td></tr><tr><td>reference_compile</td><td>66.5</td><td>1.3</td><td>264.0</td><td>171</td><td>20261026T203820Z-sprint8-paper</td></tr><tr><td>v1_vectorized</td><td>84.3</td><td>1</td><td>448.0</td><td>78</td><td>20261025T221628Z-sprint3-paper</td></tr><tr><td>v1_clean</td><td>38.2</td><td>2.2</td><td>496.0</td><td>67</td><td>20261026T145009Z-sprint4-paper</td></tr><tr><td>v1_clean_compile</td><td>19.3</td><td>4.3</td><td>256.0</td><td>13</td><td>20261026T203820Z-sprint8-paper</td></tr><tr><td>v2_recompute</td><td>38.2</td><td>2.2</td><td>496.0</td><td>82</td><td>20261026T170611Z-sprint56-paper</td></tr><tr><td>v3_triton</td><td>10.4</td><td>8.1</td><td>320.0</td><td>63</td><td>20261026T170611Z-sprint56-paper</td></tr><tr><td>v4_triton</td><td>5.11</td><td>16.4</td><td>128.0</td><td>59</td><td>20261026T203820Z-sprint8-paper</td></tr><tr><td>v5_triton</td><td>3.73</td><td>22.5</td><td>64</td><td>55</td><td>20261027T151515Z-sprint11-precise</td></tr><tr><td>v6_index</td><td>4.15</td><td>20.2</td><td>64</td><td>55</td><td>20261027T141609Z-sprint11-paper</td></tr><tr><td>v6_triton</td><td>3.31</td><td>25.4</td><td>64</td><td>7</td><td>20261027T151515Z-sprint11-precise</td></tr><tr><td>v6_precise</td><td>3.41</td><td>24.6</td><td>64</td><td>7</td><td>20261027T151515Z-sprint11-precise</td></tr><tr><td>v6_dot</td><td>12.3</td><td>6.8</td><td>64</td><td>55</td><td>20261027T141609Z-sprint11-paper</td></tr><tr><td>v2_grad_in_fwd</td><td>46.7</td><td>1.8</td><td>496.0</td><td>94</td><td>20261026T145009Z-sprint4-paper</td></tr></tbody></table></div><figcaption>Hard binning, kits23, Tesla T4, in sprint order (latest valid run per implementation; all shapes: <code>docs/ablation/ablation.md</code>). Caveat: <code>v6_index</code> and <code>v6_dot</code> come from the Sprint 11 paper run, where the first shape (kits23) ran ~1.3x slow for every Triton version; on the other shapes <code>v6_index</code> is 1.05-1.15x faster than <code>v5_triton</code>. <span class="src">docs/ablation/ablation_rows.parquet</span></figcaption></figure>
+<figure class="plot"><img src="assets/plots/docs_ablation_ladder-hard.png" alt="The ladder: time (log), % of peak bandwidth, peak memory per step" loading="lazy"><figcaption>The ladder: time (log), % of peak bandwidth, peak memory per step <span class="src">docs/ablation/ladder-hard.png</span></figcaption><p class="proves"><b>Proves:</b> each step's gain is attributable to one change (one registry entry each).</p></figure>
+<h2 id="sessions">Sessions</h2>
+<table>
+<thead>
+<tr>
+<th>page</th>
+<th>sprints</th>
+<th>you will understand</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="01-loss.html">1. The loss</a></td>
+<td>S1-S2</td>
+<td>the formula, hard vs soft binning, memory-bound, atomic contention</td>
+</tr>
+<tr>
+<td><a href="02-correctness.html">2. Correctness</a></td>
+<td>S1, S9</td>
+<td>how "identical to the original" is proven, tolerances, float64 truth</td>
+</tr>
+<tr>
+<td><a href="03-pytorch.html">3. PyTorch</a></td>
+<td>S3-S4</td>
+<td>vectorizing, deriving the backward by hand, recompute vs store</td>
+</tr>
+<tr>
+<td><a href="04-triton.html">4. Triton</a></td>
+<td>S5-S8</td>
+<td>GPU kernels: privatized histograms, fused backward, fused softmax</td>
+</tr>
+<tr>
+<td><a href="05-sprint11.html">5. Sprint 11</a></td>
+<td>S11</td>
+<td>launch overhead, O(1) bin index, packaging, failed experiments</td>
+</tr>
+<tr>
+<td><a href="06-training.html">6. Training</a></td>
+<td>S8, S11</td>
+<td>the loss inside training, Amdahl, <code>torch.compile</code> vs our kernels</td>
+</tr>
+<tr>
+<td><a href="07-tooling.html">7. Tooling</a></td>
+<td>all</td>
+<td>benchmark harness, Kaggle CLI, W&amp;B, profiler, git tags</td>
+</tr>
+<tr>
+<td><a href="evidence.html">Evidence</a></td>
+<td>all</td>
+<td>every claim and the test / plot that proves it</td>
+</tr>
+<tr>
+<td><a href="glossary.html">Glossary</a></td>
+<td>all</td>
+<td>the terms</td>
+</tr>
+</tbody>
+</table>
+<details class="check"><summary>Self-check: Why is each optimization a separate registry entry instead of one improved implementation?</summary><div class="answer">So every speedup (or slowdown) is attributable to exactly one change: the ablation table compares neighbours that differ in one idea. It also keeps the earlier versions runnable as baselines and as test oracles for the later ones.</div></details>
+<nav class="pager"><span></span><a href="01-loss.html">1. The loss and why the original is slow &rarr;</a></nav></main>
+<script src="assets/study.js"></script></body></html>

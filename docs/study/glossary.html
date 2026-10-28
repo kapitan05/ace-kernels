@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Glossary | ACE kernels study</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/pygments.css">
+</head><body>
+<aside class="side"><a class="brand" href="index.html">mL1-ACE kernels<br>
+<small>study guide</small></a><ol class="pages"><li class=""><a href="index.html">Overview: map of the project</a></li><li class=""><a href="01-loss.html">1. The loss and why the original is slow</a></li><li class=""><a href="02-correctness.html">2. Proving &#x27;same as the original&#x27;</a></li><li class=""><a href="03-pytorch.html">3. PyTorch: vectorize, handwritten backward</a></li><li class=""><a href="04-triton.html">4. Triton kernels</a></li><li class=""><a href="05-sprint11.html">5. Sprint 11: launches, index, packaging</a></li><li class=""><a href="06-training.html">6. Training: end-to-end, torch.compile</a></li><li class=""><a href="07-tooling.html">7. Tooling: bench, Kaggle, W&amp;B, profiler</a></li><li class=""><a href="evidence.html">Evidence: claim -&gt; proof</a></li><li class="current"><a href="glossary.html">Glossary</a></li></ol>
+<div class="toc"><b>On this page</b><ul></ul></div>
+<p class="meta">commit b407b4727f</p></aside>
+<main><p class="sprints">Sprints: all</p><h1 id="glossary">Glossary</h1>
+<table>
+<thead>
+<tr>
+<th>term</th>
+<th>meaning</th>
+<th>page</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ACE, mL1-ACE</td>
+<td>average calibration error: mean over non-empty bins of |mean p - mean y|; mL1 = averaged over classes, used as a loss</td>
+<td><a href="01-loss.html">1</a></td>
+</tr>
+<tr>
+<td>hard / soft binning</td>
+<td>each voxel in one bin / spread over the two nearest bin centres with linear weights (smooth in p)</td>
+<td><a href="01-loss.html">1</a></td>
+</tr>
+<tr>
+<td>calibration</td>
+<td>predicted probabilities match observed frequencies</td>
+<td><a href="01-loss.html">1</a></td>
+</tr>
+<tr>
+<td>memory-bound</td>
+<td>time set by bytes moved, not arithmetic; the limit is bandwidth (T4: 320 GB/s)</td>
+<td><a href="01-loss.html">1</a></td>
+</tr>
+<tr>
+<td>bandwidth floor</td>
+<td>ideal bytes / peak bandwidth: the fastest possible time</td>
+<td><a href="07-tooling.html">7</a></td>
+</tr>
+<tr>
+<td>roofline</td>
+<td>comparing measured performance with the hardware's compute and bandwidth limits</td>
+<td><a href="01-loss.html">1</a></td>
+</tr>
+<tr>
+<td>% of peak bandwidth</td>
+<td>ideal bytes / measured time / peak bandwidth</td>
+<td><a href="07-tooling.html">7</a></td>
+</tr>
+<tr>
+<td>launch overhead, launch-bound</td>
+<td>~5 us CPU cost per GPU kernel; a call is launch-bound when that dominates</td>
+<td><a href="05-sprint11.html">5</a></td>
+</tr>
+<tr>
+<td>kernel</td>
+<td>one GPU program launch</td>
+<td><a href="04-triton.html">4</a></td>
+</tr>
+<tr>
+<td>atomic add, contention</td>
+<td>indivisible read-modify-write; threads hitting the same address serialize</td>
+<td><a href="01-loss.html">1</a></td>
+</tr>
+<tr>
+<td>privatization</td>
+<td>each block accumulates in private registers and publishes once</td>
+<td><a href="04-triton.html">4</a></td>
+</tr>
+<tr>
+<td>Triton program, block, grid</td>
+<td>one instance of a kernel; the vector of elements it handles; all instances</td>
+<td><a href="04-triton.html">4</a></td>
+</tr>
+<tr>
+<td>constexpr</td>
+<td>compile-time kernel argument; branches on it cost nothing at run time</td>
+<td><a href="04-triton.html">4</a></td>
+</tr>
+<tr>
+<td>autotune</td>
+<td>trying several block sizes on first call, keeping the fastest</td>
+<td><a href="04-triton.html">4</a></td>
+</tr>
+<tr>
+<td>fusion</td>
+<td>doing several steps in one kernel so data is read once</td>
+<td><a href="04-triton.html">4</a></td>
+</tr>
+<tr>
+<td>recompute vs store</td>
+<td>redo cheap work in backward instead of keeping tensors in memory</td>
+<td><a href="03-pytorch.html">3</a></td>
+</tr>
+<tr>
+<td>saved tensors</td>
+<td>what autograd keeps between forward and backward</td>
+<td><a href="03-pytorch.html">3</a></td>
+</tr>
+<tr>
+<td>subgradient, kink</td>
+<td>derivative of |x| at 0 is undefined; any value in [-1, 1] is valid (PyTorch: 0)</td>
+<td><a href="02-correctness.html">2</a></td>
+</tr>
+<tr>
+<td>ulp</td>
+<td>unit in the last place: the gap between adjacent floats</td>
+<td><a href="02-correctness.html">2</a></td>
+</tr>
+<tr>
+<td>relative L2 error</td>
+<td>||a - b|| / ||b|| over the whole tensor; robust accuracy measure</td>
+<td><a href="02-correctness.html">2</a></td>
+</tr>
+<tr>
+<td>golden files</td>
+<td>stored reference outputs for fixed inputs</td>
+<td><a href="02-correctness.html">2</a></td>
+</tr>
+<tr>
+<td>oracle</td>
+<td>independent implementation used as ground truth</td>
+<td><a href="02-correctness.html">2</a></td>
+</tr>
+<tr>
+<td>gradcheck</td>
+<td>compares an analytic gradient with finite differences (float64)</td>
+<td><a href="03-pytorch.html">3</a></td>
+</tr>
+<tr>
+<td>CUDA graph</td>
+<td>a recorded sequence of kernels replayed with one launch</td>
+<td><a href="05-sprint11.html">5</a></td>
+</tr>
+<tr>
+<td>host sync</td>
+<td>the CPU waits for the GPU (e.g. <code>.item()</code>): stalls and breaks graphs</td>
+<td><a href="01-loss.html">1</a></td>
+</tr>
+<tr>
+<td>torch.compile, graph break</td>
+<td>PyTorch's compiler; a break splits the graph where it cannot trace</td>
+<td><a href="06-training.html">6</a></td>
+</tr>
+<tr>
+<td>custom op (<code>torch.library</code>)</td>
+<td>registering a function so the compiler treats it as one opaque node</td>
+<td><a href="05-sprint11.html">5</a></td>
+</tr>
+<tr>
+<td>deep supervision</td>
+<td>loss on several output resolutions of the network (4 for SegResNetDS)</td>
+<td><a href="06-training.html">6</a></td>
+</tr>
+<tr>
+<td>Amdahl's law</td>
+<td>speedup of the whole = 1 / ((1 - s) + s / x) for a part s made x times faster</td>
+<td><a href="06-training.html">6</a></td>
+</tr>
+<tr>
+<td>AMP</td>
+<td>automatic mixed precision: fp16 compute where safe</td>
+<td><a href="06-training.html">6</a></td>
+</tr>
+<tr>
+<td>tensor cores</td>
+<td>matrix-multiply units (fp16/bf16); used by Triton <code>tl.dot</code> from compute capability 8.0</td>
+<td><a href="05-sprint11.html">5</a></td>
+</tr>
+<tr>
+<td>libdevice exp</td>
+<td>NVIDIA's accurate <code>expf</code> (vs Triton's fast approximation)</td>
+<td><a href="05-sprint11.html">5</a></td>
+</tr>
+<tr>
+<td>ablation</td>
+<td>removing / adding one change at a time to attribute effects</td>
+<td><a href="index.html">index</a></td>
+</tr>
+<tr>
+<td>control run</td>
+<td>the baseline repeated, to measure its own noise</td>
+<td><a href="06-training.html">6</a></td>
+</tr>
+</tbody>
+</table>
+<nav class="pager"><a href="evidence.html">&larr; Evidence: claim -> proof</a><span></span></nav></main>
+<script src="assets/study.js"></script></body></html>

@@ -1,0 +1,16 @@
+<svg viewBox="0 0 900 250" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, Segoe UI, sans-serif" font-size="12" role="img" aria-label="Data flow of the deliverable: forward and backward kernels">
+<style>.b{fill:var(--surface);stroke:var(--line);stroke-width:1.2}.k{fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.2}.h{fill:var(--ink);font-weight:700}.s{fill:var(--ink-2);font-size:11px}.a{stroke:var(--muted);stroke-width:1.5;fill:none;marker-end:url(#ar3)}</style>
+<defs><marker id="ar3" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--muted)"/></marker></defs>
+<text class="h" x="20" y="22">forward</text>
+<rect class="b" x="20" y="34" width="150" height="56"/><text class="h" x="30" y="56">module.forward</text><text class="s" x="30" y="74">logits [B,C,...], labels</text>
+<rect class="b" x="200" y="34" width="150" height="56"/><text class="h" x="210" y="56">ace_kernels::v6_forward</text><text class="s" x="210" y="74">torch.library op</text>
+<rect class="k" x="380" y="34" width="170" height="56"/><text class="h" x="390" y="56">_hard_hist_kernel</text><text class="s" x="390" y="74">softmax + bin + histogram</text>
+<rect class="k" x="580" y="34" width="150" height="56"/><text class="h" x="590" y="56">_epilogue_kernel</text><text class="s" x="590" y="74">d, coef, f, loss, jac</text>
+<rect class="b" x="760" y="34" width="120" height="56"/><text class="h" x="770" y="56">loss</text><text class="s" x="770" y="74">saves [B,C,K] only</text>
+<text class="h" x="20" y="140">backward</text>
+<rect class="b" x="200" y="152" width="150" height="56"/><text class="h" x="210" y="174">ace_kernels::v6_backward</text><text class="s" x="210" y="192">g = jac * grad_out</text>
+<rect class="k" x="380" y="152" width="170" height="56"/><text class="h" x="390" y="174">_hard_bwd_kernel</text><text class="s" x="390" y="192">recompute softmax + bin</text>
+<rect class="b" x="580" y="152" width="150" height="56"/><text class="h" x="590" y="174">d logits</text><text class="s" x="590" y="192">same dtype as logits</text>
+<path class="a" d="M170,62 H195"/><path class="a" d="M350,62 H375"/><path class="a" d="M550,62 H575"/><path class="a" d="M730,62 H755"/><path class="a" d="M350,180 H375"/><path class="a" d="M550,180 H575"/><path class="a" d="M820,90 V125 H275 V148"/>
+<text class="s" x="20" y="238">7 GPU launches per training call: zero-fill, hist, epilogue | grad seed, g, bwd (+1 reduction). The original: 428 (hard) to 3813 (soft, 16 classes).</text>
+</svg>

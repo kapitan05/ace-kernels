@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7. Tooling: bench, Kaggle, W&amp;B, profiler | ACE kernels study</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/pygments.css">
+</head><body>
+<aside class="side"><a class="brand" href="index.html">mL1-ACE kernels<br>
+<small>study guide</small></a><ol class="pages"><li class=""><a href="index.html">Overview: map of the project</a></li><li class=""><a href="01-loss.html">1. The loss and why the original is slow</a></li><li class=""><a href="02-correctness.html">2. Proving &#x27;same as the original&#x27;</a></li><li class=""><a href="03-pytorch.html">3. PyTorch: vectorize, handwritten backward</a></li><li class=""><a href="04-triton.html">4. Triton kernels</a></li><li class=""><a href="05-sprint11.html">5. Sprint 11: launches, index, packaging</a></li><li class=""><a href="06-training.html">6. Training: end-to-end, torch.compile</a></li><li class="current"><a href="07-tooling.html">7. Tooling: bench, Kaggle, W&amp;B, profiler</a></li><li class=""><a href="evidence.html">Evidence: claim -&gt; proof</a></li><li class=""><a href="glossary.html">Glossary</a></li></ol>
+<div class="toc"><b>On this page</b><ul><li><a href="#the-workflow-of-one-experiment">The workflow of one experiment</a></li><li><a href="#configs-the-experiment-as-data">Configs: the experiment as data</a></li><li><a href="#the-harness">The harness</a></li><li><a href="#remote-gpu-kaggle-from-the-command-line">Remote GPU: Kaggle from the command line</a></li><li><a href="#experiment-tracking-wb">Experiment tracking: W&amp;B</a></li><li><a href="#profiler-and-memory-snapshots">Profiler and memory snapshots</a></li><li><a href="#the-ablation-and-the-report">The ablation and the report</a></li><li><a href="#version-control-one-tag-per-sprint">Version control: one tag per sprint</a></li><li><a href="#bugs-in-the-tooling-and-what-they-teach">Bugs in the tooling (and what they teach)</a></li></ul></div>
+<p class="meta">commit b407b4727f</p></aside>
+<main><p class="sprints">Sprints: all</p><h1 id="7-tooling-benchmark-harness-kaggle-wb-profiler">7. Tooling: benchmark harness, Kaggle, W&amp;B, profiler</h1>
+<p>The results on the other pages are only as trustworthy as the measurement. This page
+explains the machinery that produced every number, and the bugs it had.</p>
+<h2 id="the-workflow-of-one-experiment">The workflow of one experiment</h2>
+<ol>
+<li>Write a <strong>config</strong> with a hypothesis (YAML, validated by pydantic).</li>
+<li>Commit; submit a <strong>Kaggle job</strong>: a snapshot of the commit runs on a T4, starting
+   with the full test suite (the gate).</li>
+<li>The <strong>benchmark harness</strong> runs every (shape, binning, implementation) group in a
+   fresh process and writes <code>rows.parquet</code>, <code>summary.md</code>, plots.</li>
+<li><strong>Fetch</strong> the results into <code>results/kaggle/&lt;commit&gt;-&lt;job&gt;/</code>; mirror to <strong>W&amp;B</strong>.</li>
+<li>Write the report section; rebuild the <strong>ablation</strong> table; tag the sprint in git.</li>
+</ol>
+<h2 id="configs-the-experiment-as-data">Configs: the experiment as data</h2>
+<figure class="code"><div class="code-head"><span class="path">bench/configs/sprint11_deepsup.yaml:1-19</span><a href="https://github.com/kapitan05/ace-kernels/blob/b407b4727fb5e70160d718f64cf7debc8ea716c3/bench/configs/sprint11_deepsup.yaml#L1-L19" target="_blank" rel="noopener">GitHub</a></div><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="c1"># Sprint 11: the four deep-supervision levels of SegResNetDS at a 128^3 patch.</span>
+<span class="linenos"> 2</span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">sprint11-deepsup</span>
+<span class="linenos"> 3</span><span class="nt">group</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">sprint11-gaps</span>
+<span class="linenos"> 4</span><span class="nt">hypothesis</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;-</span>
+<span class="linenos"> 5</span><span class="w">  </span><span class="no">The small levels (32^3, 16^3) are launch-bound: v5 (~55 launches) sits near its</span>
+<span class="linenos"> 6</span><span class="w">  </span><span class="no">launch floor there; v6_triton's fused epilogue (&lt;= 8 launches) makes them 2-5x</span>
+<span class="linenos"> 7</span><span class="w">  </span><span class="no">faster. A CUDA graph helps v5 at small sizes and is unnecessary for v6.</span>
+<span class="linenos"> 8</span><span class="nt">device</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cuda</span>
+<span class="linenos"> 9</span><span class="nt">impls</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">reference</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">v5_triton</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">v6_triton</span><span class="p p-Indicator">]</span>
+<span class="linenos">10</span><span class="nt">binnings</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">hard</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">soft</span><span class="p p-Indicator">]</span>
+<span class="linenos">11</span><span class="nt">modes</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">fwd_bwd</span><span class="p p-Indicator">]</span>
+<span class="linenos">12</span><span class="nt">cuda_graph</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="linenos">13</span><span class="nt">warmup</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">3</span>
+<span class="linenos">14</span><span class="nt">reps</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">20</span>
+<span class="linenos">15</span><span class="nt">shapes</span><span class="p">:</span>
+<span class="linenos">16</span><span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="nv">ds0-128</span><span class="p p-Indicator">,</span><span class="nt"> batch</span><span class="p">:</span><span class="w"> </span><span class="nv">1</span><span class="p p-Indicator">,</span><span class="nt"> channels</span><span class="p">:</span><span class="w"> </span><span class="nv">4</span><span class="p p-Indicator">,</span><span class="nt"> spatial</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">128</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">128</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">128</span><span class="p p-Indicator">]}</span>
+<span class="linenos">17</span><span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="nv">ds1-64</span><span class="p p-Indicator">,</span><span class="nt"> batch</span><span class="p">:</span><span class="w"> </span><span class="nv">1</span><span class="p p-Indicator">,</span><span class="nt"> channels</span><span class="p">:</span><span class="w"> </span><span class="nv">4</span><span class="p p-Indicator">,</span><span class="nt"> spatial</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">64</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">64</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">64</span><span class="p p-Indicator">]}</span>
+<span class="linenos">18</span><span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="nv">ds2-32</span><span class="p p-Indicator">,</span><span class="nt"> batch</span><span class="p">:</span><span class="w"> </span><span class="nv">1</span><span class="p p-Indicator">,</span><span class="nt"> channels</span><span class="p">:</span><span class="w"> </span><span class="nv">4</span><span class="p p-Indicator">,</span><span class="nt"> spatial</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">32</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">32</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">32</span><span class="p p-Indicator">]}</span>
+<span class="linenos">19</span><span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="nv">ds3-16</span><span class="p p-Indicator">,</span><span class="nt"> batch</span><span class="p">:</span><span class="w"> </span><span class="nv">1</span><span class="p p-Indicator">,</span><span class="nt"> channels</span><span class="p">:</span><span class="w"> </span><span class="nv">4</span><span class="p p-Indicator">,</span><span class="nt"> spatial</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">16</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">16</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">16</span><span class="p p-Indicator">]}</span>
+</pre></div>
+<p class="code-note">Name, W&amp;B group, the hypothesis (written before the run), implementations, binnings, modes, shapes. <code>cuda_graph: true</code> adds a row with the call captured in a CUDA graph.</p></figure>
+<h2 id="the-harness">The harness</h2>
+<p><strong>Isolation.</strong> Each group runs in its own Python process. A CUDA error, a memory leak
+or an out-of-memory in one group cannot poison the next (this was added after a
+leak produced 38 false out-of-memory rows in Sprint 3):</p>
+<figure class="code"><div class="code-head"><span class="path">src/ace_bench/run.py:108-124</span><a href="https://github.com/kapitan05/ace-kernels/blob/b407b4727fb5e70160d718f64cf7debc8ea716c3/src/ace_bench/run.py#L108-L124" target="_blank" rel="noopener">GitHub</a></div><div class="highlight"><pre><span></span><span class="linenos">108</span><span class="k">def</span><span class="w"> </span><span class="nf">run_isolated</span><span class="p">(</span><span class="n">job</span><span class="p">:</span> <span class="n">Job</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">Row</span><span class="p">]:</span>
+<span class="linenos">109</span><span class="w">    </span><span class="sd">"""Run ``job`` in a fresh Python process; a crash becomes error rows."""</span>
+<span class="linenos">110</span>    <span class="n">proc</span> <span class="o">=</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">run</span><span class="p">(</span>
+<span class="linenos">111</span>        <span class="p">[</span><span class="n">sys</span><span class="o">.</span><span class="n">executable</span><span class="p">,</span> <span class="s2">"-m"</span><span class="p">,</span> <span class="s2">"ace_bench.run"</span><span class="p">,</span> <span class="s2">"--worker"</span><span class="p">],</span>
+<span class="linenos">112</span>        <span class="nb">input</span><span class="o">=</span><span class="n">job</span><span class="o">.</span><span class="n">model_dump_json</span><span class="p">(),</span>
+<span class="linenos">113</span>        <span class="n">stdout</span><span class="o">=</span><span class="n">subprocess</span><span class="o">.</span><span class="n">PIPE</span><span class="p">,</span>
+<span class="linenos">114</span>        <span class="n">text</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="linenos">115</span>        <span class="n">check</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+<span class="linenos">116</span>    <span class="p">)</span>
+<span class="linenos">117</span>    <span class="k">for</span> <span class="n">line</span> <span class="ow">in</span> <span class="n">proc</span><span class="o">.</span><span class="n">stdout</span><span class="o">.</span><span class="n">splitlines</span><span class="p">():</span>
+<span class="linenos">118</span>        <span class="k">if</span> <span class="n">line</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="n">_ROWS_MARKER</span><span class="p">):</span>
+<span class="linenos">119</span>            <span class="n">payload</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">line</span><span class="o">.</span><span class="n">removeprefix</span><span class="p">(</span><span class="n">_ROWS_MARKER</span><span class="p">))</span>
+<span class="linenos">120</span>            <span class="k">return</span> <span class="p">[</span><span class="n">Row</span><span class="o">.</span><span class="n">model_validate</span><span class="p">(</span><span class="n">r</span><span class="p">)</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">payload</span><span class="p">]</span>
+<span class="linenos">121</span>    <span class="n">error</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"worker exited with code </span><span class="si">{</span><span class="n">proc</span><span class="o">.</span><span class="n">returncode</span><span class="si">}</span><span class="s2">, no results"</span>
+<span class="linenos">122</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">job</span><span class="o">.</span><span class="n">shape</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">job</span><span class="o">.</span><span class="n">binning</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">job</span><span class="o">.</span><span class="n">impl</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">error</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="n">file</span><span class="o">=</span><span class="n">sys</span><span class="o">.</span><span class="n">stderr</span><span class="p">)</span>
+<span class="linenos">123</span>    <span class="n">template</span> <span class="o">=</span> <span class="n">run_group_template</span><span class="p">(</span><span class="n">job</span><span class="p">)</span>
+<span class="linenos">124</span>    <span class="k">return</span> <span class="p">[</span><span class="n">r</span><span class="o">.</span><span class="n">model_copy</span><span class="p">(</span><span class="n">update</span><span class="o">=</span><span class="p">{</span><span class="s2">"status"</span><span class="p">:</span> <span class="s2">"error"</span><span class="p">,</span> <span class="s2">"error"</span><span class="p">:</span> <span class="n">error</span><span class="p">})</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">template</span><span class="p">]</span>
+</pre></div>
+<p class="code-note">The parent sends the job as JSON on stdin; the worker prints its rows after a marker line; a crash becomes error rows instead of a lost run.</p></figure>
+<p><strong>What a row records.</strong> Time (median, p20, p80 of 10+ cold-L2 repetitions), effective
+bandwidth and % of the GPU's peak, the bandwidth and launch floors, kernels per call,
+peak extra memory, bytes saved for backward, and the output check vs the reference
+and vs float64 (page 2):</p>
+<figure class="code"><div class="code-head"><span class="path">src/ace_bench/measure.py:27-81</span><a href="https://github.com/kapitan05/ace-kernels/blob/b407b4727fb5e70160d718f64cf7debc8ea716c3/src/ace_bench/measure.py#L27-L81" target="_blank" rel="noopener">GitHub</a></div><div class="highlight"><pre><span></span><span class="linenos">27</span><span class="k">class</span><span class="w"> </span><span class="nc">Row</span><span class="p">(</span><span class="n">BaseModel</span><span class="p">):</span>
+<span class="linenos">28</span><span class="w">    </span><span class="sd">"""One benchmark result. Byte and time fields are None when not measured."""</span>
+<span class="linenos">29</span>
+<span class="linenos">30</span>    <span class="n">impl</span><span class="p">:</span> <span class="nb">str</span>
+<span class="linenos">31</span>    <span class="n">binning</span><span class="p">:</span> <span class="nb">str</span>
+<span class="linenos">32</span>    <span class="n">mode</span><span class="p">:</span> <span class="nb">str</span>
+<span class="linenos">33</span>    <span class="n">cuda_graph</span><span class="p">:</span> <span class="nb">bool</span>
+<span class="linenos">34</span>    <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"float32"</span>
+<span class="linenos">35</span>    <span class="n">shape</span><span class="p">:</span> <span class="nb">str</span>
+<span class="linenos">36</span>    <span class="n">batch</span><span class="p">:</span> <span class="nb">int</span>
+<span class="linenos">37</span>    <span class="n">channels</span><span class="p">:</span> <span class="nb">int</span>
+<span class="linenos">38</span>    <span class="n">spatial</span><span class="p">:</span> <span class="nb">str</span>
+<span class="linenos">39</span>    <span class="n">voxels</span><span class="p">:</span> <span class="nb">int</span>
+<span class="linenos">40</span>    <span class="n">status</span><span class="p">:</span> <span class="n">Status</span>
+<span class="linenos">41</span>    <span class="n">error</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">42</span>    <span class="n">p50_ms</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">43</span>    <span class="n">p20_ms</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">44</span>    <span class="n">p80_ms</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">45</span>    <span class="n">mean_ms</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">46</span>    <span class="n">std_ms</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">47</span>    <span class="n">reps</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">48</span>    <span class="n">input_bytes</span><span class="p">:</span> <span class="nb">int</span>
+<span class="linenos">49</span>    <span class="n">target_bytes</span><span class="p">:</span> <span class="nb">int</span>
+<span class="linenos">50</span>    <span class="n">ideal_bytes</span><span class="p">:</span> <span class="nb">int</span>
+<span class="linenos">51</span>    <span class="n">effective_gbps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">52</span>    <span class="n">pct_peak_bw</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">53</span>    <span class="n">bw_floor_ms</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">54</span>    <span class="n">launch_floor_ms</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">55</span>    <span class="n">kernels_per_call</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">56</span>    <span class="n">aten_ops_per_call</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">57</span>    <span class="n">saved_extra_bytes</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">58</span>    <span class="n">peak_extra_bytes</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">59</span>    <span class="c1"># CUDA memory still allocated after the row and its cleanup: should stay at</span>
+<span class="linenos">60</span>    <span class="c1"># the baseline; growth across rows means a leak (Sprint 3 run 4 lost 38 rows</span>
+<span class="linenos">61</span>    <span class="c1"># to ~10 GiB leaked from earlier rows).</span>
+<span class="linenos">62</span>    <span class="n">allocated_after_bytes</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">63</span>    <span class="c1"># Output check at benchmark size, against `checked_against` on the same input:</span>
+<span class="linenos">64</span>    <span class="c1"># |L - L_ref| / |L_ref| and max|g - g_ref| / max|g_ref| (untimed).</span>
+<span class="linenos">65</span>    <span class="n">checked_against</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">66</span>    <span class="n">loss_rel_err</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">67</span>    <span class="n">grad_rel_err</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">68</span>    <span class="c1"># The same errors against a float64 truth (v2_recompute in float64, formula</span>
+<span class="linenos">69</span>    <span class="c1"># validated by gradcheck), and the reference's own errors against it: tells</span>
+<span class="linenos">70</span>    <span class="c1"># "less accurate" apart from "differently rounded" (both fp32).</span>
+<span class="linenos">71</span>    <span class="n">loss_err_truth</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">72</span>    <span class="n">grad_err_truth</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">73</span>    <span class="n">ref_loss_err_truth</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">74</span>    <span class="n">ref_grad_err_truth</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">75</span>    <span class="c1"># Relative L2 gradient errors ||g - g_ref|| / ||g_ref||. The max-norm errors</span>
+<span class="linenos">76</span>    <span class="c1"># above are dominated by ill-conditioned voxels (|x| kink: bins whose mean_p -</span>
+<span class="linenos">77</span>    <span class="c1"># mean_y is ~0 flip gradient sign under any reordering; hard-bin edge flips):</span>
+<span class="linenos">78</span>    <span class="c1"># measured up to 0.54 even for the reference vs float64 truth.</span>
+<span class="linenos">79</span>    <span class="n">grad_l2_err</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">80</span>    <span class="n">grad_l2_err_truth</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">81</span>    <span class="n">ref_grad_l2_err_truth</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+</pre></div>
+<p class="code-note">One measurement = one row of the parquet file; every table in this guide is a query on these columns.</p></figure>
+<p><strong>Floors: predicted vs measured.</strong> The calculator predicts the best possible time
+from first principles; the distance to it is the honest measure of "how optimized":</p>
+<figure class="code"><div class="code-head"><span class="path">src/ace_bench/calculator.py:24-40</span><a href="https://github.com/kapitan05/ace-kernels/blob/b407b4727fb5e70160d718f64cf7debc8ea716c3/src/ace_bench/calculator.py#L24-L40" target="_blank" rel="noopener">GitHub</a></div><div class="highlight"><pre><span></span><span class="linenos">24</span><span class="k">def</span><span class="w"> </span><span class="nf">ideal_bytes</span><span class="p">(</span><span class="n">input_bytes</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">target_bytes</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">mode</span><span class="p">:</span> <span class="n">Mode</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="linenos">25</span>    <span class="k">if</span> <span class="n">mode</span> <span class="o">==</span> <span class="s2">"fwd"</span><span class="p">:</span>
+<span class="linenos">26</span>        <span class="k">return</span> <span class="n">input_bytes</span> <span class="o">+</span> <span class="n">target_bytes</span>
+<span class="linenos">27</span>    <span class="k">return</span> <span class="mi">2</span> <span class="o">*</span> <span class="p">(</span><span class="n">input_bytes</span> <span class="o">+</span> <span class="n">target_bytes</span><span class="p">)</span> <span class="o">+</span> <span class="n">input_bytes</span>
+<span class="linenos">28</span>
+<span class="linenos">29</span>
+<span class="linenos">30</span><span class="k">def</span><span class="w"> </span><span class="nf">bandwidth_floor_ms</span><span class="p">(</span><span class="n">nbytes</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">peak_gbps</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
+<span class="linenos">31</span>    <span class="k">return</span> <span class="n">nbytes</span> <span class="o">/</span> <span class="p">(</span><span class="n">peak_gbps</span> <span class="o">*</span> <span class="mf">1e9</span><span class="p">)</span> <span class="o">*</span> <span class="mf">1e3</span>
+<span class="linenos">32</span>
+<span class="linenos">33</span>
+<span class="linenos">34</span><span class="k">def</span><span class="w"> </span><span class="nf">launch_floor_ms</span><span class="p">(</span><span class="n">kernels</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">launch_us</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="n">LAUNCH_US</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
+<span class="linenos">35</span>    <span class="k">return</span> <span class="n">kernels</span> <span class="o">*</span> <span class="n">launch_us</span> <span class="o">/</span> <span class="mf">1e3</span>
+<span class="linenos">36</span>
+<span class="linenos">37</span>
+<span class="linenos">38</span><span class="k">def</span><span class="w"> </span><span class="nf">effective_gbps</span><span class="p">(</span><span class="n">nbytes</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">ms</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
+<span class="linenos">39</span><span class="w">    </span><span class="sd">"""Ideal bytes divided by measured time: the bandwidth the run "achieved"."""</span>
+<span class="linenos">40</span>    <span class="k">return</span> <span class="n">nbytes</span> <span class="o">/</span> <span class="p">(</span><span class="n">ms</span> <span class="o">/</span> <span class="mf">1e3</span><span class="p">)</span> <span class="o">/</span> <span class="mf">1e9</span>
+</pre></div>
+<p class="code-note">Ideal bytes (inputs read once in forward, twice + gradient write in backward), bandwidth floor = bytes / peak GB/s, launch floor = kernels x 5 us.</p></figure>
+<h2 id="remote-gpu-kaggle-from-the-command-line">Remote GPU: Kaggle from the command line</h2>
+<p>No notebook: <code>ace_bench.remote</code> uploads a <code>git archive</code> of the current commit as a
+private Kaggle dataset, pushes a script kernel with a T4, polls its status and
+downloads <code>results.tgz</code>:</p>
+<figure class="code"><div class="code-head"><span class="path">src/ace_bench/remote.py:65-97</span><a href="https://github.com/kapitan05/ace-kernels/blob/b407b4727fb5e70160d718f64cf7debc8ea716c3/src/ace_bench/remote.py#L65-L97" target="_blank" rel="noopener">GitHub</a></div><div class="highlight"><pre><span></span><span class="linenos">65</span><span class="k">def</span><span class="w"> </span><span class="nf">upload_snapshot</span><span class="p">(</span><span class="n">user</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="linenos">66</span><span class="w">    </span><span class="sd">"""Upload the committed tree as a new version of the private source dataset."""</span>
+<span class="linenos">67</span>    <span class="k">if</span> <span class="n">_git</span><span class="p">(</span><span class="s2">"status"</span><span class="p">,</span> <span class="s2">"--porcelain"</span><span class="p">,</span> <span class="s2">"--untracked-files=no"</span><span class="p">):</span>
+<span class="linenos">68</span>        <span class="n">sys</span><span class="o">.</span><span class="n">exit</span><span class="p">(</span><span class="s2">"uncommitted changes: commit first (only committed code runs)"</span><span class="p">)</span>
+<span class="linenos">69</span>    <span class="n">sha</span> <span class="o">=</span> <span class="n">_git</span><span class="p">(</span><span class="s2">"rev-parse"</span><span class="p">,</span> <span class="s2">"HEAD"</span><span class="p">)</span>
+<span class="linenos">70</span>    <span class="n">dataset_id</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">user</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="n">DATASET_SLUG</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos">71</span>    <span class="k">with</span> <span class="n">tempfile</span><span class="o">.</span><span class="n">TemporaryDirectory</span><span class="p">()</span> <span class="k">as</span> <span class="n">tmp</span><span class="p">:</span>
+<span class="linenos">72</span>        <span class="n">folder</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">tmp</span><span class="p">)</span>
+<span class="linenos">73</span>        <span class="n">commit</span> <span class="o">=</span> <span class="n">folder</span> <span class="o">/</span> <span class="s2">"COMMIT"</span>
+<span class="linenos">74</span>        <span class="n">commit</span><span class="o">.</span><span class="n">write_text</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">sha</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">75</span>        <span class="n">tar_path</span> <span class="o">=</span> <span class="n">folder</span> <span class="o">/</span> <span class="s2">"src.tar"</span>
+<span class="linenos">76</span>        <span class="n">_git</span><span class="p">(</span><span class="s2">"archive"</span><span class="p">,</span> <span class="s2">"--format=tar"</span><span class="p">,</span> <span class="s2">"-o"</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">tar_path</span><span class="p">),</span> <span class="s2">"HEAD"</span><span class="p">)</span>
+<span class="linenos">77</span>        <span class="k">with</span> <span class="n">tarfile</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="n">tar_path</span><span class="p">,</span> <span class="s2">"a"</span><span class="p">)</span> <span class="k">as</span> <span class="n">tar</span><span class="p">:</span>
+<span class="linenos">78</span>            <span class="n">tar</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">commit</span><span class="p">,</span> <span class="n">arcname</span><span class="o">=</span><span class="s2">"COMMIT"</span><span class="p">)</span>
+<span class="linenos">79</span>        <span class="n">commit</span><span class="o">.</span><span class="n">unlink</span><span class="p">()</span>
+<span class="linenos">80</span>        <span class="n">meta</span> <span class="o">=</span> <span class="p">{</span>
+<span class="linenos">81</span>            <span class="s2">"title"</span><span class="p">:</span> <span class="n">DATASET_SLUG</span><span class="p">,</span>
+<span class="linenos">82</span>            <span class="s2">"id"</span><span class="p">:</span> <span class="n">dataset_id</span><span class="p">,</span>
+<span class="linenos">83</span>            <span class="s2">"licenses"</span><span class="p">:</span> <span class="p">[{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"other"</span><span class="p">}],</span>
+<span class="linenos">84</span>        <span class="p">}</span>
+<span class="linenos">85</span>        <span class="p">(</span><span class="n">folder</span> <span class="o">/</span> <span class="s2">"dataset-metadata.json"</span><span class="p">)</span><span class="o">.</span><span class="n">write_text</span><span class="p">(</span><span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="n">meta</span><span class="p">))</span>
+<span class="linenos">86</span>        <span class="n">exists</span> <span class="o">=</span> <span class="s2">"ready"</span> <span class="ow">in</span> <span class="n">_kaggle</span><span class="p">(</span><span class="s2">"datasets"</span><span class="p">,</span> <span class="s2">"status"</span><span class="p">,</span> <span class="n">dataset_id</span><span class="p">,</span> <span class="n">check</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos">87</span>        <span class="k">if</span> <span class="n">exists</span><span class="p">:</span>
+<span class="linenos">88</span>            <span class="n">_kaggle</span><span class="p">(</span><span class="s2">"datasets"</span><span class="p">,</span> <span class="s2">"version"</span><span class="p">,</span> <span class="s2">"-p"</span><span class="p">,</span> <span class="n">tmp</span><span class="p">,</span> <span class="s2">"-m"</span><span class="p">,</span> <span class="n">sha</span><span class="p">[:</span><span class="mi">12</span><span class="p">],</span> <span class="s2">"-q"</span><span class="p">)</span>
+<span class="linenos">89</span>        <span class="k">else</span><span class="p">:</span>
+<span class="linenos">90</span>            <span class="n">_kaggle</span><span class="p">(</span><span class="s2">"datasets"</span><span class="p">,</span> <span class="s2">"create"</span><span class="p">,</span> <span class="s2">"-p"</span><span class="p">,</span> <span class="n">tmp</span><span class="p">,</span> <span class="s2">"-q"</span><span class="p">)</span>  <span class="c1"># private by default</span>
+<span class="linenos">91</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"uploaded </span><span class="si">{</span><span class="n">sha</span><span class="p">[:</span><span class="mi">12</span><span class="p">]</span><span class="si">}</span><span class="s2"> -&gt; dataset </span><span class="si">{</span><span class="n">dataset_id</span><span class="si">}</span><span class="s2">, waiting until ready"</span><span class="p">)</span>
+<span class="linenos">92</span>    <span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="mi">30</span><span class="p">)</span>  <span class="c1"># right after upload, status can still report the old version</span>
+<span class="linenos">93</span>    <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">60</span><span class="p">):</span>
+<span class="linenos">94</span>        <span class="k">if</span> <span class="s2">"ready"</span> <span class="ow">in</span> <span class="n">_kaggle</span><span class="p">(</span><span class="s2">"datasets"</span><span class="p">,</span> <span class="s2">"status"</span><span class="p">,</span> <span class="n">dataset_id</span><span class="p">,</span> <span class="n">check</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+<span class="linenos">95</span>            <span class="k">return</span> <span class="n">sha</span>
+<span class="linenos">96</span>        <span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="mi">10</span><span class="p">)</span>
+<span class="linenos">97</span>    <span class="n">sys</span><span class="o">.</span><span class="n">exit</span><span class="p">(</span><span class="s2">"dataset not ready after 10 min"</span><span class="p">)</span>
+</pre></div>
+<p class="code-note">The snapshot contains a COMMIT file: results are always traceable to the exact code (and <code>fetch</code> warns if they do not match).</p></figure>
+<p>Every job script starts with the same setup: GPU check, locked environment
+(<code>uv sync --frozen</code>), then the correctness gate:</p>
+<figure class="code"><div class="code-head"><span class="path">kaggle/_setup.sh:1-28</span><a href="https://github.com/kapitan05/ace-kernels/blob/b407b4727fb5e70160d718f64cf7debc8ea716c3/kaggle/_setup.sh#L1-L28" target="_blank" rel="noopener">GitHub</a></div><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="c1"># Shared by kaggle/run_*.sh (sourced): GPU info, locked env, correctness gate.</span>
+<span class="linenos"> 2</span><span class="nb">set</span><span class="w"> </span>-euo<span class="w"> </span>pipefail
+<span class="linenos"> 3</span>
+<span class="linenos"> 4</span><span class="nb">echo</span><span class="w"> </span><span class="s2">"== GPU"</span>
+<span class="linenos"> 5</span>nvidia-smi<span class="w"> </span>--query-gpu<span class="o">=</span>name,driver_version,memory.total<span class="w"> </span>--format<span class="o">=</span>csv
+<span class="linenos"> 6</span>
+<span class="linenos"> 7</span><span class="nb">echo</span><span class="w"> </span><span class="s2">"== Environment (uv, locked deps)"</span>
+<span class="linenos"> 8</span><span class="nb">command</span><span class="w"> </span>-v<span class="w"> </span>uv<span class="w"> </span>&gt;/dev/null<span class="w"> </span><span class="o">||</span><span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-q<span class="w"> </span>uv
+<span class="linenos"> 9</span>uv<span class="w"> </span>sync<span class="w"> </span>--frozen
+<span class="linenos">10</span>uv<span class="w"> </span>run<span class="w"> </span>python<span class="w"> </span>-<span class="w"> </span><span class="s">&lt;&lt;'PY'</span>
+<span class="linenos">11</span><span class="s">import torch</span>
+<span class="linenos">12</span><span class="s">assert torch.cuda.is_available(), "no CUDA device visible"</span>
+<span class="linenos">13</span><span class="s">major, minor = torch.cuda.get_device_capability()</span>
+<span class="linenos">14</span><span class="s">arch = f"sm_{major}{minor}"</span>
+<span class="linenos">15</span><span class="s">print(torch.__version__, "cuda", torch.version.cuda, torch.cuda.get_device_name(), arch)</span>
+<span class="linenos">16</span><span class="s">assert arch in torch.cuda.get_arch_list(), (</span>
+<span class="linenos">17</span><span class="s">    f"locked torch build lacks {arch}: {torch.cuda.get_arch_list()}")</span>
+<span class="linenos">18</span><span class="s">PY</span>
+<span class="linenos">19</span>
+<span class="linenos">20</span><span class="nb">echo</span><span class="w"> </span><span class="s2">"== Correctness gate (CPU + CUDA)"</span>
+<span class="linenos">21</span><span class="c1"># PYTEST_ARGS / PYTEST_K narrow the gate for quick dev jobs (default: whole suite);</span>
+<span class="linenos">22</span><span class="c1"># GATE_CONTINUE=1 (dev jobs only) keeps going after failures to also get timings</span>
+<span class="linenos">23</span><span class="k">if</span><span class="w"> </span>!<span class="w"> </span>uv<span class="w"> </span>run<span class="w"> </span>pytest<span class="w"> </span><span class="si">${</span><span class="nv">PYTEST_ARGS</span><span class="k">:-</span><span class="nv">tests</span><span class="p">/</span><span class="si">}</span><span class="w"> </span><span class="si">${</span><span class="nv">PYTEST_K</span><span class="p">:+-k </span><span class="s2">"</span><span class="nv">$PYTEST_K</span><span class="s2">"</span><span class="si">}</span><span class="w"> </span>-q<span class="w"> </span>-p<span class="w"> </span>no:cacheprovider<span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="linenos">24</span><span class="w">  </span><span class="k">if</span><span class="w"> </span><span class="o">[[</span><span class="w"> </span>-n<span class="w"> </span><span class="s2">"</span><span class="si">${</span><span class="nv">GATE_CONTINUE</span><span class="k">:-</span><span class="si">}</span><span class="s2">"</span><span class="w"> </span><span class="o">]]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span><span class="s2">"== GATE FAILED (continuing: dev job)"</span><span class="p">;</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="nb">exit</span><span class="w"> </span><span class="m">1</span><span class="p">;</span><span class="w"> </span><span class="k">fi</span>
+<span class="linenos">25</span><span class="k">fi</span>
+<span class="linenos">26</span>
+<span class="linenos">27</span><span class="nv">WANDB</span><span class="o">=</span><span class="s2">""</span>
+<span class="linenos">28</span><span class="k">if</span><span class="w"> </span><span class="o">[[</span><span class="w"> </span>-n<span class="w"> </span><span class="s2">"</span><span class="si">${</span><span class="nv">WANDB_API_KEY</span><span class="k">:-</span><span class="si">}</span><span class="s2">"</span><span class="w"> </span><span class="o">]]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span><span class="w"> </span><span class="nv">WANDB</span><span class="o">=</span><span class="s2">"--wandb"</span><span class="p">;</span><span class="w"> </span><span class="k">fi</span>
+</pre></div>
+<p class="code-note"><code>set -euo pipefail</code>; a failing test aborts the job before any benchmark (dev jobs may continue with <code>GATE_CONTINUE=1</code> to also get timings).</p></figure>
+<div class="run"><button class="copy" type="button">copy</button><pre><code>$ uv run python -m ace_bench.remote submit kaggle/run_sprint11.sh --no-wait</code></pre><p class="expect">push the job; then <code>... remote status kaggle/run_sprint11.sh</code> and <code>... remote fetch kaggle/run_sprint11.sh</code></p></div>
+<h2 id="experiment-tracking-wb">Experiment tracking: W&amp;B</h2>
+<p>Parquet files in git-ignored <code>results/</code> are the source of truth; W&amp;B (project
+<code>ace-kernels</code>) is the shareable mirror: one W&amp;B run per benchmark run, grouped by
+sprint, with the config, hypothesis, environment, the row table, plots and profiles.
+API keys only come from the environment, never from code:</p>
+<figure class="code"><div class="code-head"><span class="path">src/ace_bench/tracking.py:96-114</span><a href="https://github.com/kapitan05/ace-kernels/blob/b407b4727fb5e70160d718f64cf7debc8ea716c3/src/ace_bench/tracking.py#L96-L114" target="_blank" rel="noopener">GitHub</a></div><div class="highlight"><pre><span></span><span class="linenos"> 96</span><span class="k">def</span><span class="w"> </span><span class="nf">mirror_run</span><span class="p">(</span><span class="n">run_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">,</span> <span class="n">project</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"ace-kernels"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos"> 97</span><span class="w">    </span><span class="sd">"""Upload one finished benchmark dir (meta.json + rows.parquet) to W&amp;B."""</span>
+<span class="linenos"> 98</span>    <span class="n">meta</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">((</span><span class="n">run_dir</span> <span class="o">/</span> <span class="s2">"meta.json"</span><span class="p">)</span><span class="o">.</span><span class="n">read_text</span><span class="p">())</span>
+<span class="linenos"> 99</span>    <span class="n">df</span> <span class="o">=</span> <span class="n">pl</span><span class="o">.</span><span class="n">read_parquet</span><span class="p">(</span><span class="n">run_dir</span> <span class="o">/</span> <span class="s2">"rows.parquet"</span><span class="p">)</span>
+<span class="linenos">100</span>    <span class="n">config</span> <span class="o">=</span> <span class="n">meta</span><span class="p">[</span><span class="s2">"config"</span><span class="p">]</span>
+<span class="linenos">101</span>    <span class="k">with</span> <span class="n">Tracker</span><span class="p">(</span>
+<span class="linenos">102</span>        <span class="kc">True</span><span class="p">,</span>
+<span class="linenos">103</span>        <span class="n">project</span><span class="o">=</span><span class="n">project</span><span class="p">,</span>
+<span class="linenos">104</span>        <span class="n">group</span><span class="o">=</span><span class="n">config</span><span class="p">[</span><span class="s2">"group"</span><span class="p">],</span>
+<span class="linenos">105</span>        <span class="n">job_type</span><span class="o">=</span><span class="s2">"bench"</span><span class="p">,</span>
+<span class="linenos">106</span>        <span class="n">name</span><span class="o">=</span><span class="n">meta</span><span class="p">[</span><span class="s2">"run_id"</span><span class="p">],</span>
+<span class="linenos">107</span>        <span class="n">config</span><span class="o">=</span><span class="p">{</span><span class="o">**</span><span class="n">config</span><span class="p">,</span> <span class="s2">"env"</span><span class="p">:</span> <span class="n">meta</span><span class="p">[</span><span class="s2">"env"</span><span class="p">]},</span>
+<span class="linenos">108</span>        <span class="n">tags</span><span class="o">=</span><span class="p">[</span><span class="o">*</span><span class="n">config</span><span class="p">[</span><span class="s2">"impls"</span><span class="p">],</span> <span class="n">meta</span><span class="p">[</span><span class="s2">"env"</span><span class="p">][</span><span class="s2">"device_name"</span><span class="p">]],</span>
+<span class="linenos">109</span>    <span class="p">)</span> <span class="k">as</span> <span class="n">tracker</span><span class="p">:</span>
+<span class="linenos">110</span>        <span class="n">tracker</span><span class="o">.</span><span class="n">log_table</span><span class="p">(</span><span class="s2">"results"</span><span class="p">,</span> <span class="n">df</span><span class="p">)</span>
+<span class="linenos">111</span>        <span class="n">tracker</span><span class="o">.</span><span class="n">log_images</span><span class="p">(</span><span class="nb">sorted</span><span class="p">((</span><span class="n">run_dir</span> <span class="o">/</span> <span class="s2">"plots"</span><span class="p">)</span><span class="o">.</span><span class="n">glob</span><span class="p">(</span><span class="s2">"*.png"</span><span class="p">)))</span>
+<span class="linenos">112</span>        <span class="n">tracker</span><span class="o">.</span><span class="n">summary</span><span class="p">({</span><span class="s2">"run_id"</span><span class="p">:</span> <span class="n">meta</span><span class="p">[</span><span class="s2">"run_id"</span><span class="p">],</span> <span class="s2">"rows"</span><span class="p">:</span> <span class="n">df</span><span class="o">.</span><span class="n">height</span><span class="p">})</span>
+<span class="linenos">113</span>        <span class="n">tracker</span><span class="o">.</span><span class="n">log_files</span><span class="p">(</span><span class="sa">f</span><span class="s2">"bench-</span><span class="si">{</span><span class="n">config</span><span class="p">[</span><span class="s1">'name'</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="s2">"bench-results"</span><span class="p">,</span> <span class="p">[</span><span class="n">run_dir</span><span class="p">])</span>
+<span class="linenos">114</span>        <span class="k">return</span> <span class="n">tracker</span><span class="o">.</span><span class="n">url</span>
+</pre></div>
+<p class="code-note">Upload an already-finished result folder (runs on the Mac after <code>fetch</code>).</p></figure>
+<h2 id="profiler-and-memory-snapshots">Profiler and memory snapshots</h2>
+<p><code>ace_bench.profile</code> records three steps with <code>torch.profiler</code> (kernel names and GPU
+time per kernel, <code>trace.json</code> for <a href="https://ui.perfetto.dev">ui.perfetto.dev</a>), the
+tensors saved for backward, and a CUDA memory snapshot for
+<a href="https://pytorch.org/memory_viz">pytorch.org/memory_viz</a> (allocation timeline: you see
+the original's per-voxel tensors pile up and ours not). <code>ncu</code> (hardware counters) is
+blocked on Kaggle, so occupancy and DRAM-byte counters wait for the RTX PRO 6000.</p>
+<figure class="code"><div class="code-head"><span class="path">src/ace_bench/profile.py:104-164</span><a href="https://github.com/kapitan05/ace-kernels/blob/b407b4727fb5e70160d718f64cf7debc8ea716c3/src/ace_bench/profile.py#L104-L164" target="_blank" rel="noopener">GitHub</a></div><div class="highlight"><pre><span></span><span class="linenos">104</span><span class="k">def</span><span class="w"> </span><span class="nf">profile_case</span><span class="p">(</span>
+<span class="linenos">105</span>    <span class="n">impl</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+<span class="linenos">106</span>    <span class="n">shape</span><span class="p">:</span> <span class="n">ShapeSpec</span><span class="p">,</span>
+<span class="linenos">107</span>    <span class="n">config</span><span class="p">:</span> <span class="n">ACEConfig</span><span class="p">,</span>
+<span class="linenos">108</span>    <span class="n">mode</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+<span class="linenos">109</span>    <span class="n">device</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+<span class="linenos">110</span>    <span class="n">out_root</span><span class="p">:</span> <span class="n">Path</span><span class="p">,</span>
+<span class="linenos">111</span>    <span class="n">nsys</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+<span class="linenos">112</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Path</span><span class="p">:</span>
+<span class="linenos">113</span>    <span class="n">out</span> <span class="o">=</span> <span class="n">out_root</span> <span class="o">/</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">impl</span><span class="si">}</span><span class="s2">-</span><span class="si">{</span><span class="n">config</span><span class="o">.</span><span class="n">binning</span><span class="si">}</span><span class="s2">-</span><span class="si">{</span><span class="n">shape</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">-</span><span class="si">{</span><span class="n">mode</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos">114</span>    <span class="n">out</span><span class="o">.</span><span class="n">mkdir</span><span class="p">(</span><span class="n">parents</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos">115</span>    <span class="n">x</span><span class="p">,</span> <span class="n">y</span> <span class="o">=</span> <span class="n">make_inputs</span><span class="p">(</span>
+<span class="linenos">116</span>        <span class="n">InputSpec</span><span class="p">(</span><span class="n">shape</span><span class="o">.</span><span class="n">batch</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">channels</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">spatial</span><span class="p">),</span> <span class="n">config</span><span class="p">,</span> <span class="n">device</span>
+<span class="linenos">117</span>    <span class="p">)</span>
+<span class="linenos">118</span>    <span class="n">x</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos">119</span>    <span class="n">warnings</span><span class="o">.</span><span class="n">simplefilter</span><span class="p">(</span><span class="s2">"ignore"</span><span class="p">,</span> <span class="ne">UserWarning</span><span class="p">)</span>
+<span class="linenos">120</span>    <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">2</span><span class="p">):</span>  <span class="c1"># compile / allocator warmup</span>
+<span class="linenos">121</span>        <span class="n">_step</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">y</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">impl</span><span class="p">,</span> <span class="n">mode</span><span class="p">,</span> <span class="n">nvtx</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos">122</span>
+<span class="linenos">123</span>    <span class="k">if</span> <span class="n">nsys</span><span class="p">:</span>  <span class="c1"># nsys --capture-range=cudaProfilerApi records only this block</span>
+<span class="linenos">124</span>        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos">125</span>        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">profiler</span><span class="o">.</span><span class="n">start</span><span class="p">()</span>
+<span class="linenos">126</span>        <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">ACTIVE_STEPS</span><span class="p">):</span>
+<span class="linenos">127</span>            <span class="n">_step</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">y</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">impl</span><span class="p">,</span> <span class="n">mode</span><span class="p">,</span> <span class="n">nvtx</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos">128</span>        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos">129</span>        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">profiler</span><span class="o">.</span><span class="n">stop</span><span class="p">()</span>
+<span class="linenos">130</span>        <span class="k">return</span> <span class="n">out</span>
+<span class="linenos">131</span>
+<span class="linenos">132</span>    <span class="n">activities</span> <span class="o">=</span> <span class="p">[</span><span class="n">ProfilerActivity</span><span class="o">.</span><span class="n">CPU</span><span class="p">]</span>
+<span class="linenos">133</span>    <span class="k">if</span> <span class="n">device</span> <span class="o">==</span> <span class="s2">"cuda"</span><span class="p">:</span>
+<span class="linenos">134</span>        <span class="n">activities</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">ProfilerActivity</span><span class="o">.</span><span class="n">CUDA</span><span class="p">)</span>
+<span class="linenos">135</span>    <span class="k">with</span> <span class="n">profile</span><span class="p">(</span>
+<span class="linenos">136</span>        <span class="n">activities</span><span class="o">=</span><span class="n">activities</span><span class="p">,</span>
+<span class="linenos">137</span>        <span class="n">schedule</span><span class="o">=</span><span class="n">schedule</span><span class="p">(</span><span class="n">wait</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">warmup</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">active</span><span class="o">=</span><span class="n">ACTIVE_STEPS</span><span class="p">,</span> <span class="n">repeat</span><span class="o">=</span><span class="mi">1</span><span class="p">),</span>
+<span class="linenos">138</span>        <span class="n">record_shapes</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="linenos">139</span>        <span class="n">profile_memory</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="linenos">140</span>    <span class="p">)</span> <span class="k">as</span> <span class="n">prof</span><span class="p">:</span>
+<span class="linenos">141</span>        <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">2</span> <span class="o">+</span> <span class="n">ACTIVE_STEPS</span><span class="p">):</span>
+<span class="linenos">142</span>            <span class="n">_step</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">y</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">impl</span><span class="p">,</span> <span class="n">mode</span><span class="p">,</span> <span class="n">nvtx</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos">143</span>            <span class="k">if</span> <span class="n">device</span> <span class="o">==</span> <span class="s2">"cuda"</span><span class="p">:</span>
+<span class="linenos">144</span>                <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos">145</span>            <span class="n">prof</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+<span class="linenos">146</span>    <span class="n">prof</span><span class="o">.</span><span class="n">export_chrome_trace</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">out</span> <span class="o">/</span> <span class="s2">"trace.json"</span><span class="p">))</span>
+<span class="linenos">147</span>    <span class="n">kernels</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="mi">1</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">prof</span><span class="o">.</span><span class="n">events</span><span class="p">()</span> <span class="k">if</span> <span class="n">e</span><span class="o">.</span><span class="n">device_type</span><span class="o">.</span><span class="n">name</span> <span class="o">==</span> <span class="s2">"CUDA"</span><span class="p">)</span>
+<span class="linenos">148</span>    <span class="n">sort</span> <span class="o">=</span> <span class="s2">"self_cuda_time_total"</span> <span class="k">if</span> <span class="n">device</span> <span class="o">==</span> <span class="s2">"cuda"</span> <span class="k">else</span> <span class="s2">"self_cpu_time_total"</span>
+<span class="linenos">149</span>    <span class="n">table</span> <span class="o">=</span> <span class="n">prof</span><span class="o">.</span><span class="n">key_averages</span><span class="p">()</span><span class="o">.</span><span class="n">table</span><span class="p">(</span><span class="n">sort_by</span><span class="o">=</span><span class="n">sort</span><span class="p">,</span> <span class="n">row_limit</span><span class="o">=</span><span class="mi">40</span><span class="p">)</span>
+<span class="linenos">150</span>    <span class="n">header</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">impl</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">config</span><span class="o">.</span><span class="n">binning</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">shape</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">mode</span><span class="si">}</span><span class="s2"> on </span><span class="si">{</span><span class="n">device</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span>
+<span class="linenos">151</span>    <span class="k">if</span> <span class="n">device</span> <span class="o">==</span> <span class="s2">"cuda"</span><span class="p">:</span>
+<span class="linenos">152</span>        <span class="n">header</span> <span class="o">+=</span> <span class="sa">f</span><span class="s2">"CUDA kernels per step: </span><span class="si">{</span><span class="n">kernels</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">ACTIVE_STEPS</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span>
+<span class="linenos">153</span>    <span class="p">(</span><span class="n">out</span> <span class="o">/</span> <span class="s2">"ops.txt"</span><span class="p">)</span><span class="o">.</span><span class="n">write_text</span><span class="p">(</span><span class="n">header</span> <span class="o">+</span> <span class="s2">"</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="n">table</span> <span class="o">+</span> <span class="s2">"</span><span class="se">\n</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">154</span>
+<span class="linenos">155</span>    <span class="n">_write_saved</span><span class="p">(</span><span class="n">out</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">y</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">impl</span><span class="p">)</span>
+<span class="linenos">156</span>    <span class="k">if</span> <span class="n">device</span> <span class="o">==</span> <span class="s2">"cuda"</span><span class="p">:</span>
+<span class="linenos">157</span>        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">memory</span><span class="o">.</span><span class="n">_record_memory_history</span><span class="p">(</span><span class="n">max_entries</span><span class="o">=</span><span class="mi">200_000</span><span class="p">)</span>
+<span class="linenos">158</span>        <span class="n">_step</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">y</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">impl</span><span class="p">,</span> <span class="n">mode</span><span class="p">,</span> <span class="n">nvtx</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos">159</span>        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos">160</span>        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">memory</span><span class="o">.</span><span class="n">_dump_snapshot</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">out</span> <span class="o">/</span> <span class="s2">"memory_snapshot.pickle"</span><span class="p">))</span>
+<span class="linenos">161</span>        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">memory</span><span class="o">.</span><span class="n">_record_memory_history</span><span class="p">(</span><span class="n">enabled</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+<span class="linenos">162</span>    <span class="k">if</span> <span class="n">impl</span> <span class="o">==</span> <span class="s2">"reference"</span><span class="p">:</span>
+<span class="linenos">163</span>        <span class="n">_write_explain</span><span class="p">(</span><span class="n">out</span><span class="p">,</span> <span class="n">x</span><span class="o">.</span><span class="n">detach</span><span class="p">(),</span> <span class="n">y</span><span class="p">,</span> <span class="n">config</span><span class="p">)</span>
+<span class="linenos">164</span>    <span class="k">return</span> <span class="n">out</span>
+</pre></div>
+<p class="code-note">Warm-up step, then 3 profiled steps; NVTX ranges for Nsight Systems when available.</p></figure>
+<h2 id="the-ablation-and-the-report">The ablation and the report</h2>
+<p><code>ace_bench.ablation</code> collects every fetched run, drops runs known to be invalid
+(documented with the reason), keeps the latest valid measurement per implementation x
+shape, and writes <code>docs/ablation/</code> (markdown, LaTeX, plots):</p>
+<figure class="code"><div class="code-head"><span class="path">src/ace_bench/ablation.py:25-49</span><a href="https://github.com/kapitan05/ace-kernels/blob/b407b4727fb5e70160d718f64cf7debc8ea716c3/src/ace_bench/ablation.py#L25-L49" target="_blank" rel="noopener">GitHub</a></div><div class="highlight"><pre><span></span><span class="linenos">25</span><span class="n">EXCLUDED_RUNS</span> <span class="o">=</span> <span class="p">{</span>
+<span class="linenos">26</span>    <span class="s2">"afa97a0e3643"</span><span class="p">:</span> <span class="s2">"Sprint 3 run 4: memory leak in the harness (38 OOM rows)"</span><span class="p">,</span>
+<span class="linenos">27</span>    <span class="s2">"967b720e1e11"</span><span class="p">:</span> <span class="s2">"Sprint 5+6 run 1: class-presence scatter and grid-limit bugs, "</span>
+<span class="linenos">28</span>    <span class="s2">"superseded by dc02925"</span><span class="p">,</span>
+<span class="linenos">29</span><span class="p">}</span>
+<span class="linenos">30</span>
+<span class="linenos">31</span><span class="c1"># The ablation ladder: one change per step, in sprint order.</span>
+<span class="linenos">32</span><span class="n">LADDER</span> <span class="o">=</span> <span class="p">[</span>
+<span class="linenos">33</span>    <span class="p">(</span><span class="s2">"reference"</span><span class="p">,</span> <span class="s2">"S1"</span><span class="p">,</span> <span class="s2">"original upstream loss"</span><span class="p">),</span>
+<span class="linenos">34</span>    <span class="p">(</span><span class="s2">"reference_checkpoint"</span><span class="p">,</span> <span class="s2">"S2"</span><span class="p">,</span> <span class="s2">"+ torch.utils.checkpoint"</span><span class="p">),</span>
+<span class="linenos">35</span>    <span class="p">(</span><span class="s2">"reference_compile"</span><span class="p">,</span> <span class="s2">"S2"</span><span class="p">,</span> <span class="s2">"+ torch.compile"</span><span class="p">),</span>
+<span class="linenos">36</span>    <span class="p">(</span><span class="s2">"v1_vectorized"</span><span class="p">,</span> <span class="s2">"S3"</span><span class="p">,</span> <span class="s2">"B x C loop removed"</span><span class="p">),</span>
+<span class="linenos">37</span>    <span class="p">(</span><span class="s2">"v1_clean"</span><span class="p">,</span> <span class="s2">"S3"</span><span class="p">,</span> <span class="s2">"+ sums, no one-hot, no host sync"</span><span class="p">),</span>
+<span class="linenos">38</span>    <span class="p">(</span><span class="s2">"v1_clean_compile"</span><span class="p">,</span> <span class="s2">"S3"</span><span class="p">,</span> <span class="s2">"+ torch.compile"</span><span class="p">),</span>
+<span class="linenos">39</span>    <span class="p">(</span><span class="s2">"v2_recompute"</span><span class="p">,</span> <span class="s2">"S4"</span><span class="p">,</span> <span class="s2">"handwritten backward (PyTorch)"</span><span class="p">),</span>
+<span class="linenos">40</span>    <span class="p">(</span><span class="s2">"v3_triton"</span><span class="p">,</span> <span class="s2">"S5"</span><span class="p">,</span> <span class="s2">"Triton private-histogram forward"</span><span class="p">),</span>
+<span class="linenos">41</span>    <span class="p">(</span><span class="s2">"v4_triton"</span><span class="p">,</span> <span class="s2">"S6/S7"</span><span class="p">,</span> <span class="s2">"+ Triton backward"</span><span class="p">),</span>
+<span class="linenos">42</span>    <span class="p">(</span><span class="s2">"v5_triton"</span><span class="p">,</span> <span class="s2">"S8"</span><span class="p">,</span> <span class="s2">"+ softmax fused into both kernels"</span><span class="p">),</span>
+<span class="linenos">43</span>    <span class="p">(</span><span class="s2">"v6_index"</span><span class="p">,</span> <span class="s2">"S11"</span><span class="p">,</span> <span class="s2">"+ O(1) bin index"</span><span class="p">),</span>
+<span class="linenos">44</span>    <span class="p">(</span><span class="s2">"v6_triton"</span><span class="p">,</span> <span class="s2">"S11"</span><span class="p">,</span> <span class="s2">"+ one-launch epilogue, torch.library op"</span><span class="p">),</span>
+<span class="linenos">45</span>    <span class="p">(</span><span class="s2">"v6_precise"</span><span class="p">,</span> <span class="s2">"S11"</span><span class="p">,</span> <span class="s2">"+ libdevice exp (bins like torch.softmax)"</span><span class="p">),</span>
+<span class="linenos">46</span>    <span class="p">(</span><span class="s2">"v6_dot"</span><span class="p">,</span> <span class="s2">"S11"</span><span class="p">,</span> <span class="s2">"side branch: v6_index + tensor-core reduction"</span><span class="p">),</span>
+<span class="linenos">47</span><span class="p">]</span>
+<span class="linenos">48</span><span class="n">PAPER_SHAPES</span> <span class="o">=</span> <span class="p">[</span><span class="s2">"kits23"</span><span class="p">,</span> <span class="s2">"acdc17"</span><span class="p">,</span> <span class="s2">"brats21"</span><span class="p">,</span> <span class="s2">"amos22"</span><span class="p">]</span>
+<span class="linenos">49</span><span class="n">MiB</span> <span class="o">=</span> <span class="mi">2</span><span class="o">**</span><span class="mi">20</span>
+</pre></div>
+<p class="code-note"><code>EXCLUDED_RUNS</code> (with reasons) and the <code>LADDER</code>: the order and one-line meaning of every step.</p></figure>
+<h2 id="version-control-one-tag-per-sprint">Version control: one tag per sprint</h2>
+<p>Every validated sprint is a git tag, so any state can be checked out, rerun and
+compared:</p>
+<div class="run"><button class="copy" type="button">copy</button><pre><code>$ git tag &amp;&amp; git diff --stat sprint-9 sprint-11</code></pre><p class="expect">the list of sprint tags; what Sprint 11 changed</p></div>
+<h2 id="bugs-in-the-tooling-and-what-they-teach">Bugs in the tooling (and what they teach)</h2>
+<table>
+<thead>
+<tr>
+<th>bug</th>
+<th>symptom</th>
+<th>fix</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>saved-tensor pack hook returned the tensor itself</td>
+<td>reference cycle, GPU memory leak, 38 false OOM rows</td>
+<td>return <code>t.detach()</code>; process isolation</td>
+</tr>
+<tr>
+<td><code>pytest ... \| tail -1</code></td>
+<td>a failing suite looked green (tail's exit code)</td>
+<td><code>set -o pipefail</code> everywhere</td>
+</tr>
+<tr>
+<td>grid axis 1 = voxel blocks</td>
+<td>"invalid argument" at 256^3 (limit 65535)</td>
+<td>blocks on axis 0 + regression test</td>
+</tr>
+<tr>
+<td>first shape of a run slower for all Triton kernels</td>
+<td>v6_index looked slower than v5 at kits23</td>
+<td>cross-check in a second run; noted in the report</td>
+</tr>
+<tr>
+<td>float atomics compared bit-exactly in a test</td>
+<td>false failures (order of atomic adds varies)</td>
+<td>exact counts, sums within rounding</td>
+</tr>
+<tr>
+<td>reference soft path: host-to-device copy</td>
+<td>CUDA graph capture failed</td>
+<td>a test asserts it (documented, not "fixed": it is the reference)</td>
+</tr>
+</tbody>
+</table>
+<details class="check"><summary>Self-check: Why does every benchmark group run in its own process?</summary><div class="answer">So one group's failure (CUDA error, OOM, leak) cannot change the next group's measurements; and peak-memory numbers start from a clean allocator.</div></details>
+<details class="check"><summary>Self-check: Why is the time measured with CUDA events and an L2 flush instead of time.time()?</summary><div class="answer">GPU calls are asynchronous (Python returns early); events time the GPU work itself. The L2 flush makes each repetition read from DRAM, as in training, instead of from a warm cache.</div></details>
+<details class="check"><summary>Self-check: Where do you find the exact code that produced a number in the report?</summary><div class="answer">The run folder name starts with the commit hash (<code>results/kaggle/&lt;commit&gt;-&lt;job&gt;/</code>), the snapshot has a COMMIT file, and every row has <code>run_id</code> and the env (GPU, versions, git sha).</div></details>
+<nav class="pager"><a href="06-training.html">&larr; 6. Training: end-to-end, torch.compile</a><a href="evidence.html">Evidence: claim -> proof &rarr;</a></nav></main>
+<script src="assets/study.js"></script></body></html>
