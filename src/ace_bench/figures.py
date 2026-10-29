@@ -9,6 +9,7 @@ import argparse
 import json
 from collections import Counter
 from pathlib import Path
+from typing import Any
 
 import matplotlib
 
@@ -297,6 +298,97 @@ def fig_breakdown(out: Path) -> Path:
     return _save(fig, out, "time-breakdown.png")
 
 
+TraceEvent = dict[str, Any]
+
+
+def _one_step(trace: Path) -> tuple[list[TraceEvent], list[TraceEvent]]:
+    """GPU events (kernels, copies) of the middle profiled step and the CPU
+    launch calls that issued them (linked by the profiler's correlation id)."""
+    events = json.loads(trace.read_text())["traceEvents"]
+    gpu = sorted(
+        (e for e in events if e.get("cat") in ("kernel", "gpu_memcpy")),
+        key=lambda e: e["ts"],
+    )
+    third = len(gpu) // ACTIVE_STEPS
+    step = gpu[third : 2 * third]
+    ids = {e.get("args", {}).get("correlation") for e in step}
+    cpu = [
+        e
+        for e in events
+        if e.get("cat") == "cuda_runtime"
+        and e.get("args", {}).get("correlation") in ids
+    ]
+    return step, cpu
+
+
+def fig_timeline(out: Path) -> Path:
+    """CPU launches vs GPU execution for one step: GPU-bound looks like slide 41."""
+    traces = [
+        (
+            "original (reference), hard, kits23",
+            "fb8ebdca9b33-run-sprint2/results/"
+            "profile/reference-hard-kits23-fwd_bwd/trace.json",
+        ),
+        (
+            "ours (v6_triton), hard, kits23",
+            "60a3c6df2c3c-run-sprint11/results/"
+            "profile/v6_triton-hard-kits23-fwd_bwd/trace.json",
+        ),
+    ]
+    fig, axes = plt.subplots(2, 1, figsize=(12, 4.6), facecolor=SURFACE)
+    for ax, (title, rel) in zip(axes, traces, strict=True):
+        gpu, cpu = _one_step(KAGGLE / rel)
+        t0 = min(e["ts"] for e in cpu + gpu)
+        end = max(e["ts"] + e["dur"] for e in gpu)
+        busy = sum(e["dur"] for e in gpu) / (end - min(e["ts"] for e in gpu))
+        for e in cpu:
+            ax.barh(
+                1,
+                e["dur"] / 1e3,
+                left=(e["ts"] - t0) / 1e3,
+                height=0.5,
+                color=SERIES[3],
+                linewidth=0,
+            )
+        for e in gpu:
+            scatter = any(k in e["name"].lower() for k in ("scatter", "index"))
+            color = SERIES[1] if scatter else SERIES[0]
+            ax.barh(
+                0,
+                e["dur"] / 1e3,
+                left=(e["ts"] - t0) / 1e3,
+                height=0.5,
+                color=color,
+                linewidth=0,
+            )
+        ax.set_yticks([0, 1], ["GPU kernels", "CPU launches"])
+        ax.set_xlabel("ms from the first launch of the step", fontsize=8, color=TEXT_2)
+        _style(
+            ax,
+            f"{title}: {len(gpu)} GPU ops, GPU busy {100 * busy:.0f}% "
+            f"of its active span",
+        )
+    axes[0].text(
+        0.99,
+        0.95,
+        "orange = scatter / index (atomics)",
+        ha="right",
+        va="top",
+        transform=axes[0].transAxes,
+        fontsize=7,
+        color=SERIES[1],
+    )
+    fig.suptitle(
+        "One fwd+bwd step on the GPU timeline (torch.profiler traces, Tesla T4): "
+        "CPU launches finish early, the GPU runs back to back = GPU-bound",
+        x=0.01,
+        ha="left",
+        fontsize=10,
+        color=TEXT,
+    )
+    return _save(fig, out, "timeline.png")
+
+
 def fig_step(out: Path) -> Path:
     """Training step: eager / torch.compile x reference / ours."""
     steps = _run("60a3c6df2c3c-run-sprint11/results/*sprint11-e2e/steps.parquet")
@@ -342,6 +434,7 @@ FIGURES = [
     fig_scaling,
     fig_breakdown,
     fig_step,
+    fig_timeline,
 ]
 
 

@@ -117,6 +117,113 @@ Other waste found in Sprint 2 (each fixed by a later sprint):
 | separate softmax pass (and again in backward) | 31% of v4's time | S8 (v5) |
 | host-to-device copy in soft binning (`torch.tensor` in forward) | breaks CUDA graphs | S3 |
 
+## GPU-bound, launch-bound or sync-bound? How we diagnosed it
+
+A program on a GPU is slow for one of three reasons. Which one decides the fix:
+
+| regime | what happens | timeline looks like | fix |
+|---|---|---|---|
+| **GPU-bound** | the CPU queues kernels quickly, then waits; the GPU runs them back to back | GPU row full, no gaps | better kernels: less memory traffic, fusion, a better algorithm, lower precision |
+| **launch-bound** (CPU / CUDA-API bound) | each kernel is so small that the GPU finishes it before the CPU has launched the next | gaps between GPU kernels | fewer, bigger kernels: fusion, CUDA graphs, `torch.compile`, bigger batches |
+| **sync-bound** | CPU and GPU take turns: `.item()`, `.cpu()`, a host-to-device copy, data-dependent Python `if` | both rows with gaps, alternating | remove syncs, keep data on the GPU, overlap |
+
+Launch cost is at least ~5 us of CPU time per kernel, so `kernels x 5 us` is a
+**lower bound** on the time of a call no matter how fast the GPU is: the **launch
+floor** (`launch_floor_ms` in every benchmark row). It is optimistic: an eager PyTorch
+op also costs Python and dispatcher time (measured below: ~15 us per kernel for the
+original), so a launch-bound call sits within a few x of the floor, while a GPU-bound
+call is tens of x above it.
+
+### A torch.compile speedup does not prove "launch-bound"
+
+`torch.compile` changes three things at once: (1) it merges kernels, which removes
+launches (helps only if launch-bound); (2) it **fuses** chains of elementwise ops into
+one kernel that reads its inputs once and keeps intermediates in registers, cutting
+DRAM traffic (helps a memory-bound GPU workload, even with zero launch overhead);
+(3) it generates different code for some ops. For the original loss, (2) is where the
+gain comes from: soft binning is a long chain of elementwise ops on voxel-sized
+temporaries (11x the input), and fusing it saves bytes, not launches. Knowing *that*
+compile helped tells you something was wasteful; it does not tell you *what*. Four
+tests do.
+
+### Test 1: launch floor vs measured time, and Test 2: a CUDA graph
+
+A CUDA graph records a sequence of kernels once and replays it with a single launch:
+it removes **only** the launch cost. If a call gets faster in a graph, it was
+launch-bound; if not, it was not. The harness measures every case both ways
+(`cuda_graph: true` in the config adds the graphed row):
+
+::walk src/ace_bench/measure.py:233-256
+@ def _graphed(fn: Callable[[], object]) -> Callable[[], object]: | **Capture**: warm up on a side stream (required by PyTorch: lazy initialization must not happen during capture), then record one call into a `CUDAGraph`. The returned function is `graph.replay`: one launch for the whole recorded sequence. If the call does something a graph cannot contain (a host-to-device copy, a sync), capture fails and the row gets `status = capture_failed`.
+@ def _count_ops(fn: Callable[[], object]) -> tuple[int, int]: | **Counting launches**: run one call under `torch.profiler` and count GPU events (kernels and copies) and ATen operator calls. `kernels_per_call` x 5 us = `launch_floor_ms` (`calculator.launch_floor_ms`).
+::end
+
+Sprint 2 baseline run (experiment `baseline-paper`, config `bench/configs/baseline_paper.yaml`,
+Tesla T4, commit `fb8ebdca9b33`):
+
+::table results/kaggle/fb8ebdca9b33-run-sprint2/results/*baseline-paper/rows.parquet | df.filter((pl.col("shape") == "kits23") & (pl.col("mode") == "fwd_bwd")).select("binning", "impl", "cuda_graph", "status", pl.col("p50_ms").round(1).alias("measured ms"), "kernels_per_call", pl.col("launch_floor_ms").round(2).alias("launch floor ms"), (pl.col("launch_floor_ms") / pl.col("p50_ms") * 100).round(1).alias("launches % of time")).sort("binning", "impl", "cuda_graph") | kits23 (2 x 4 x 128^3), forward + backward. Folder: `results/kaggle/fb8ebdca9b33-run-sprint2/results/20261025T195519Z-baseline-paper/`.
+
+How to read it:
+
+- **Original, hard**: 428 kernels -> launch floor 2.1 ms, measured 99.4 ms. Launches
+  are ~2% of the time: **GPU-bound**. With a CUDA graph: 99.4 ms, identical. Test 2
+  confirms Test 1: there was nothing for the graph to remove.
+- **Original + compile, hard**: 171 kernels, 65 ms. Fewer launches *and* faster, but
+  the launches saved (~1.3 ms) cannot explain 34 ms: the gain is fused, cheaper GPU
+  work. Still GPU-bound, still dominated by the atomic scatters.
+- **Original, soft, graph = `capture_failed`**: the soft path builds a tensor with
+  `torch.tensor(..., device="cuda")` in every call, a host-to-device copy, which a
+  graph cannot contain. That is the **sync-bound** pattern (here harmless for speed, but
+  it blocks graphs). Our versions contain no such copy; a test enforces it:
+
+::walk tests/test_sync.py:28-50
+@ def test_has_no_host_sync( | Runs for every graph-safe implementation (all ours), both binnings, with and without background and class weights.
+@ ace_loss(x, y, config, impl=impl)  # warm up lazy init outside the check | One call first: legitimate one-time work (Triton compilation, cached tables) happens here, outside the check.
+@ torch.cuda.set_sync_debug_mode("error") | **The check**: in this mode PyTorch raises an error on *any* operation that makes the CPU wait for the GPU (`.item()`, `.cpu()`, a blocking copy). Forward and backward must complete without one.
+::end
+
+### Test 3: the timeline
+
+The profiler records when the CPU issued each launch and when the GPU ran each
+kernel (Sprint 2 and Sprint 11 profiles, `results/kaggle/<commit>/results/profile/*/trace.json`):
+
+::plot docs/study/assets/figures/timeline.png | One forward + backward step of the original and of ours (kits23, hard): top row of each panel = CPU launch calls, bottom row = GPU execution | the original is GPU-bound: the CPU has issued all ~430 launches after ~15 ms and waits, while the GPU runs gap-free for 100 ms, mostly in scatter kernels (orange). Ours does the same work in 7 GPU operations and 3.6 ms; its one visible gap (~0.17 ms) is the CPU preparing a Triton launch: launch overhead, small here but dominant on small inputs (Test 4).
+
+To see it yourself, drag `results/kaggle/fb8ebdca9b33-run-sprint2/results/profile/reference-hard-kits23-fwd_bwd/trace.json`
+into [ui.perfetto.dev](https://ui.perfetto.dev).
+
+### Test 4: shrink the input
+
+GPU work shrinks with the data; launch cost does not. So as the input gets smaller, a
+GPU-bound call gets faster, and a launch-bound call stops getting faster at its
+launch floor. Sprint 11 measured the four deep-supervision sizes of the paper's network
+(experiment `sprint11-deepsup`, config `bench/configs/sprint11_deepsup.yaml`):
+
+::table results/kaggle/60a3c6df2c3c-run-sprint11/results/*sprint11-deepsup/rows.parquet | df.filter((pl.col("binning") == "hard") & (pl.col("impl").is_in(["reference", "v5_triton", "v6_triton"]))).with_columns(pl.when(pl.col("cuda_graph")).then(pl.lit("graph")).otherwise(pl.lit("eager")).alias("run")).select("shape", "impl", "run", pl.col("p50_ms").round(3).alias("ms"), "kernels_per_call", pl.col("launch_floor_ms").round(3).alias("launch floor ms")).sort("impl", "shape", "run") | Hard binning, B=1, C=4, Tesla T4. Folder: `results/kaggle/60a3c6df2c3c-run-sprint11/results/20261027T144629Z-sprint11-deepsup/`.
+
+- **Original at 128^3**: 47.5 ms with or without a graph: GPU-bound.
+- **Original at 16^3**: 3.7 ms eager, 1.2 ms in a graph: **the same code is
+  launch-bound at small sizes** (~230 launches at batch 1; the graph removes their
+  CPU cost and lands at the launch floor, 1.16 ms).
+- **v5 (Sprint 8)**: ~0.85-0.9 ms from 64^3 down to 16^3, flat, and a graph cuts
+  it to 0.15 ms: launch-bound (~55 launches). This finding led to Sprint 11's fused
+  epilogue: **v6** has 7 launches and falls to 0.034 ms at 16^3, with or without a graph.
+
+::plot docs/study/assets/figures/scaling.png | Time vs volume (log-log); dotted = each implementation's launch floor | flat = launch-bound, rising with volume = GPU-bound. The original flattens below 64^3; v5 is flat across the small sizes; v6 keeps scaling down to its floor.
+
+### The diagnosis in one table
+
+| implementation | training size (128^3) | small (16^3) | fixed by |
+|---|---|---|---|
+| original | GPU-bound (atomic contention) | launch-bound (~230 launches per call at B=1) | privatized histograms (S5), fusion (S6-S8) |
+| original, soft | + a host-to-device copy per call (blocks graphs) | | no copies in our versions (S3+) |
+| v5 | GPU-bound (histogram kernel) | launch-bound (~55 launches) | one-launch epilogue (S11) |
+| v6 | GPU-bound (histogram reduction: the remaining gap) | near its launch floor (7 launches) | next: the reduction (RTX PRO 6000) |
+
+::check torch.compile made the original soft loss 4.7x faster. Does that mean it was launch-bound? | No. Its launches cost ~5 ms of 184 ms. Compile fused a long chain of elementwise ops on voxel-sized temporaries, so the GPU moved far fewer bytes: a GPU (memory) win. The CUDA-graph test is the clean check for launch overhead.
+::check The same code is GPU-bound at 128^3 and launch-bound at 16^3. How? | Launch cost is fixed per kernel (~5 us x kernels); GPU work scales with the data. At 16^3 the data is 512x smaller, the GPU work drops below the launch cost, and the launches dominate.
+::check Which two numbers in a benchmark row tell you the regime without any profiler? | `p50_ms` and `launch_floor_ms` (= kernels_per_call x 5 us). Within a few x: launch-bound (the floor is optimistic). Tens of x apart: GPU-bound. Confirm with the graphed row: a launch-bound call drops to about the floor.
+
 ## How speed is measured (preview of page 7)
 
 GPU work is asynchronous: Python returns before the GPU finishes, so wall-clock timing

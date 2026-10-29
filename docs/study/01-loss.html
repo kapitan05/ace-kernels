@@ -7,8 +7,8 @@
 </head><body>
 <aside class="side"><a class="brand" href="index.html">mL1-ACE kernels<br>
 <small>study guide</small></a><ol class="pages"><li class=""><a href="index.html">Overview: map of the project</a></li><li class="current"><a href="01-loss.html">1. The loss and why the original is slow</a></li><li class=""><a href="02-correctness.html">2. Proving &#x27;same as the original&#x27;</a></li><li class=""><a href="03-pytorch.html">3. PyTorch: vectorize, handwritten backward</a></li><li class=""><a href="04-triton.html">4. Triton kernels</a></li><li class=""><a href="05-sprint11.html">5. Sprint 11: launches, index, packaging</a></li><li class=""><a href="06-training.html">6. Training: end-to-end, torch.compile</a></li><li class=""><a href="07-tooling.html">7. Tooling: bench, Kaggle, W&amp;B, profiler</a></li><li class=""><a href="evidence.html">Evidence: claim -&gt; proof</a></li><li class=""><a href="glossary.html">Glossary</a></li></ol>
-<div class="toc"><b>On this page</b><ul><li><a href="#concept-what-ml1-ace-measures">Concept: what mL1-ACE measures</a></li><li><a href="#worked-example">Worked example</a></li><li><a href="#the-original-code">The original code</a></li><li><a href="#why-it-is-slow-memory-bound-work-done-the-expensive-way">Why it is slow: memory-bound work done the expensive way</a></li><li><a href="#how-speed-is-measured-preview-of-page-7">How speed is measured (preview of page 7)</a></li><li><a href="#try-it">Try it</a></li><li><a href="#evidence">Evidence</a></li></ul></div>
-<p class="meta">commit 089df3e038</p></aside>
+<div class="toc"><b>On this page</b><ul><li><a href="#concept-what-ml1-ace-measures">Concept: what mL1-ACE measures</a></li><li><a href="#worked-example">Worked example</a></li><li><a href="#the-original-code">The original code</a></li><li><a href="#why-it-is-slow-memory-bound-work-done-the-expensive-way">Why it is slow: memory-bound work done the expensive way</a></li><li><a href="#gpu-bound-launch-bound-or-sync-bound-how-we-diagnosed-it">GPU-bound, launch-bound or sync-bound? How we diagnosed it</a></li><li><a href="#how-speed-is-measured-preview-of-page-7">How speed is measured (preview of page 7)</a></li><li><a href="#try-it">Try it</a></li><li><a href="#evidence">Evidence</a></li></ul></div>
+<p class="meta">commit 1ae681f14f</p></aside>
 <main><p class="sprints">Sprints: S1-S2</p><h1 id="1-the-loss-and-why-the-original-is-slow">1. The loss, and why the original is slow</h1>
 <h2 id="concept-what-ml1-ace-measures">Concept: what mL1-ACE measures</h2>
 <p>A segmentation network outputs, for every voxel and class, a probability <code>p</code>. A
@@ -68,7 +68,7 @@ the model is over-confident there, and the loss pushes those probabilities down.
 <p>The upstream loss (<code>src/ace_reference/hardl1ace.py</code>, frozen and SHA-checked) computes
 the per-bin statistics with a Python loop over batch x class, and three scatter
 operations per slice:</p>
-<figure class="walk"><div class="code-head"><span class="path">walk-through: src/ace_reference/hardl1ace.py:70-105</span><a href="https://github.com/kapitan05/ace-kernels/blob/089df3e03805da8196e93d3acba6b27bcfe9ac58/src/ace_reference/hardl1ace.py#L70-L105" target="_blank" rel="noopener">GitHub</a></div><div class="step"><div class="step-code"><div class="highlight"><pre><span></span><span class="linenos">70</span>    <span class="n">batch_size</span><span class="p">,</span> <span class="n">num_channels</span> <span class="o">=</span> <span class="nb">input</span><span class="o">.</span><span class="n">shape</span><span class="p">[:</span><span class="mi">2</span><span class="p">]</span>
+<figure class="walk"><div class="code-head"><span class="path">walk-through: src/ace_reference/hardl1ace.py:70-105</span><a href="https://github.com/kapitan05/ace-kernels/blob/1ae681f14fba3a99015fbf64bfc5158a585fdc97/src/ace_reference/hardl1ace.py#L70-L105" target="_blank" rel="noopener">GitHub</a></div><div class="step"><div class="step-code"><div class="highlight"><pre><span></span><span class="linenos">70</span>    <span class="n">batch_size</span><span class="p">,</span> <span class="n">num_channels</span> <span class="o">=</span> <span class="nb">input</span><span class="o">.</span><span class="n">shape</span><span class="p">[:</span><span class="mi">2</span><span class="p">]</span>
 <span class="linenos">71</span>    <span class="n">boundaries</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">linspace</span><span class="p">(</span>
 <span class="linenos">72</span>        <span class="n">start</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span>
 <span class="linenos">73</span>        <span class="n">end</span><span class="o">=</span><span class="mf">1.0</span> <span class="o">+</span> <span class="n">torch</span><span class="o">.</span><span class="n">finfo</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span><span class="o">.</span><span class="n">eps</span><span class="p">,</span>
@@ -109,7 +109,7 @@ operations per slice:</p>
 </pre></div>
 </div><div class="step-note"><p>Bins with no voxels get NaN means, so that the later <code>nanmean</code> skips them. This boolean-mask assignment is another pass over <code>[B, C, K]</code> (cheap) but uses a mask that autograd also has to track.</p></div></div></figure>
 <p>Then the loss itself, from the per-bin means:</p>
-<figure class="walk"><div class="code-head"><span class="path">walk-through: src/ace_reference/hardl1ace.py:233-278</span><a href="https://github.com/kapitan05/ace-kernels/blob/089df3e03805da8196e93d3acba6b27bcfe9ac58/src/ace_reference/hardl1ace.py#L233-L278" target="_blank" rel="noopener">GitHub</a></div><div class="step"><div class="step-code"><div class="highlight"><pre><span></span><span class="linenos">233</span>        <span class="n">mean_p_per_bin</span><span class="p">,</span> <span class="n">mean_gt_per_bin</span><span class="p">,</span> <span class="n">bin_counts</span> <span class="o">=</span> <span class="n">hard_binned_calibration</span><span class="p">(</span>
+<figure class="walk"><div class="code-head"><span class="path">walk-through: src/ace_reference/hardl1ace.py:233-278</span><a href="https://github.com/kapitan05/ace-kernels/blob/1ae681f14fba3a99015fbf64bfc5158a585fdc97/src/ace_reference/hardl1ace.py#L233-L278" target="_blank" rel="noopener">GitHub</a></div><div class="step"><div class="step-code"><div class="highlight"><pre><span></span><span class="linenos">233</span>        <span class="n">mean_p_per_bin</span><span class="p">,</span> <span class="n">mean_gt_per_bin</span><span class="p">,</span> <span class="n">bin_counts</span> <span class="o">=</span> <span class="n">hard_binned_calibration</span><span class="p">(</span>
 <span class="linenos">234</span>            <span class="nb">input</span><span class="p">,</span> <span class="n">target</span><span class="p">,</span> <span class="n">num_bins</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">num_bins</span><span class="p">,</span> <span class="n">right</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">right</span>
 <span class="linenos">235</span>        <span class="p">)</span>
 </pre></div>
@@ -219,12 +219,194 @@ registers and publish it with one atomic per bin.</p>
 </tr>
 </tbody>
 </table>
+<h2 id="gpu-bound-launch-bound-or-sync-bound-how-we-diagnosed-it">GPU-bound, launch-bound or sync-bound? How we diagnosed it</h2>
+<p>A program on a GPU is slow for one of three reasons. Which one decides the fix:</p>
+<table>
+<thead>
+<tr>
+<th>regime</th>
+<th>what happens</th>
+<th>timeline looks like</th>
+<th>fix</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>GPU-bound</strong></td>
+<td>the CPU queues kernels quickly, then waits; the GPU runs them back to back</td>
+<td>GPU row full, no gaps</td>
+<td>better kernels: less memory traffic, fusion, a better algorithm, lower precision</td>
+</tr>
+<tr>
+<td><strong>launch-bound</strong> (CPU / CUDA-API bound)</td>
+<td>each kernel is so small that the GPU finishes it before the CPU has launched the next</td>
+<td>gaps between GPU kernels</td>
+<td>fewer, bigger kernels: fusion, CUDA graphs, <code>torch.compile</code>, bigger batches</td>
+</tr>
+<tr>
+<td><strong>sync-bound</strong></td>
+<td>CPU and GPU take turns: <code>.item()</code>, <code>.cpu()</code>, a host-to-device copy, data-dependent Python <code>if</code></td>
+<td>both rows with gaps, alternating</td>
+<td>remove syncs, keep data on the GPU, overlap</td>
+</tr>
+</tbody>
+</table>
+<p>Launch cost is at least ~5 us of CPU time per kernel, so <code>kernels x 5 us</code> is a
+<strong>lower bound</strong> on the time of a call no matter how fast the GPU is: the <strong>launch
+floor</strong> (<code>launch_floor_ms</code> in every benchmark row). It is optimistic: an eager PyTorch
+op also costs Python and dispatcher time (measured below: ~15 us per kernel for the
+original), so a launch-bound call sits within a few x of the floor, while a GPU-bound
+call is tens of x above it.</p>
+<h3 id="a-torchcompile-speedup-does-not-prove-launch-bound">A torch.compile speedup does not prove "launch-bound"</h3>
+<p><code>torch.compile</code> changes three things at once: (1) it merges kernels, which removes
+launches (helps only if launch-bound); (2) it <strong>fuses</strong> chains of elementwise ops into
+one kernel that reads its inputs once and keeps intermediates in registers, cutting
+DRAM traffic (helps a memory-bound GPU workload, even with zero launch overhead);
+(3) it generates different code for some ops. For the original loss, (2) is where the
+gain comes from: soft binning is a long chain of elementwise ops on voxel-sized
+temporaries (11x the input), and fusing it saves bytes, not launches. Knowing <em>that</em>
+compile helped tells you something was wasteful; it does not tell you <em>what</em>. Four
+tests do.</p>
+<h3 id="test-1-launch-floor-vs-measured-time-and-test-2-a-cuda-graph">Test 1: launch floor vs measured time, and Test 2: a CUDA graph</h3>
+<p>A CUDA graph records a sequence of kernels once and replays it with a single launch:
+it removes <strong>only</strong> the launch cost. If a call gets faster in a graph, it was
+launch-bound; if not, it was not. The harness measures every case both ways
+(<code>cuda_graph: true</code> in the config adds the graphed row):</p>
+<figure class="walk"><div class="code-head"><span class="path">walk-through: src/ace_bench/measure.py:233-256</span><a href="https://github.com/kapitan05/ace-kernels/blob/1ae681f14fba3a99015fbf64bfc5158a585fdc97/src/ace_bench/measure.py#L233-L256" target="_blank" rel="noopener">GitHub</a></div><div class="step"><div class="step-code"><div class="highlight"><pre><span></span><span class="linenos">233</span><span class="k">def</span><span class="w"> </span><span class="nf">_graphed</span><span class="p">(</span><span class="n">fn</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[],</span> <span class="nb">object</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">Callable</span><span class="p">[[],</span> <span class="nb">object</span><span class="p">]:</span>
+<span class="linenos">234</span><span class="w">    </span><span class="sd">"""Capture ``fn`` in a CUDA graph; the returned callable replays it."""</span>
+<span class="linenos">235</span>    <span class="n">stream</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span><span class="p">()</span>
+<span class="linenos">236</span>    <span class="n">stream</span><span class="o">.</span><span class="n">wait_stream</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_stream</span><span class="p">())</span>
+<span class="linenos">237</span>    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">stream</span><span class="p">(</span><span class="n">stream</span><span class="p">):</span>
+<span class="linenos">238</span>        <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">3</span><span class="p">):</span>  <span class="c1"># warm up on a side stream, as required for capture</span>
+<span class="linenos">239</span>            <span class="n">fn</span><span class="p">()</span>
+<span class="linenos">240</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span><span class="o">.</span><span class="n">wait_stream</span><span class="p">(</span><span class="n">stream</span><span class="p">)</span>
+<span class="linenos">241</span>    <span class="n">graph</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">CUDAGraph</span><span class="p">()</span>
+<span class="linenos">242</span>    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">graph</span><span class="p">(</span><span class="n">graph</span><span class="p">):</span>
+<span class="linenos">243</span>        <span class="n">fn</span><span class="p">()</span>
+<span class="linenos">244</span>    <span class="k">return</span> <span class="n">graph</span><span class="o">.</span><span class="n">replay</span>
+</pre></div>
+</div><div class="step-note"><p><strong>Capture</strong>: warm up on a side stream (required by PyTorch: lazy initialization must not happen during capture), then record one call into a <code>CUDAGraph</code>. The returned function is <code>graph.replay</code>: one launch for the whole recorded sequence. If the call does something a graph cannot contain (a host-to-device copy, a sync), capture fails and the row gets <code>status = capture_failed</code>.</p></div></div><div class="step"><div class="step-code"><div class="highlight"><pre><span></span><span class="linenos">247</span><span class="k">def</span><span class="w"> </span><span class="nf">_count_ops</span><span class="p">(</span><span class="n">fn</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[],</span> <span class="nb">object</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]:</span>
+<span class="linenos">248</span><span class="w">    </span><span class="sd">"""CUDA kernels and aten op calls launched by one call (CUDA only)."""</span>
+<span class="linenos">249</span>    <span class="k">with</span> <span class="n">profile</span><span class="p">(</span><span class="n">activities</span><span class="o">=</span><span class="p">[</span><span class="n">ProfilerActivity</span><span class="o">.</span><span class="n">CPU</span><span class="p">,</span> <span class="n">ProfilerActivity</span><span class="o">.</span><span class="n">CUDA</span><span class="p">])</span> <span class="k">as</span> <span class="n">prof</span><span class="p">:</span>
+<span class="linenos">250</span>        <span class="n">fn</span><span class="p">()</span>
+<span class="linenos">251</span>        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos">252</span>    <span class="n">events</span> <span class="o">=</span> <span class="n">prof</span><span class="o">.</span><span class="n">events</span><span class="p">()</span>
+<span class="linenos">253</span>    <span class="n">kernels</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="mi">1</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">events</span> <span class="k">if</span> <span class="n">e</span><span class="o">.</span><span class="n">device_type</span><span class="o">.</span><span class="n">name</span> <span class="o">==</span> <span class="s2">"CUDA"</span><span class="p">)</span>
+<span class="linenos">254</span>    <span class="n">aten</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="mi">1</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">events</span> <span class="k">if</span> <span class="n">e</span><span class="o">.</span><span class="n">name</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">"aten::"</span><span class="p">))</span>
+<span class="linenos">255</span>    <span class="k">return</span> <span class="n">kernels</span><span class="p">,</span> <span class="n">aten</span>
+</pre></div>
+</div><div class="step-note"><p><strong>Counting launches</strong>: run one call under <code>torch.profiler</code> and count GPU events (kernels and copies) and ATen operator calls. <code>kernels_per_call</code> x 5 us = <code>launch_floor_ms</code> (<code>calculator.launch_floor_ms</code>).</p></div></div></figure>
+<p>Sprint 2 baseline run (experiment <code>baseline-paper</code>, config <code>bench/configs/baseline_paper.yaml</code>,
+Tesla T4, commit <code>fb8ebdca9b33</code>):</p>
+<figure class="table"><div class="scroll"><table><thead><tr><th>binning</th><th>impl</th><th>cuda_graph</th><th>status</th><th>measured ms</th><th>kernels_per_call</th><th>launch floor ms</th><th>launches % of time</th></tr></thead><tbody><tr><td>hard</td><td>reference</td><td>False</td><td>ok</td><td>99.4</td><td>428</td><td>2.14</td><td>2.2</td></tr><tr><td>hard</td><td>reference</td><td>True</td><td>ok</td><td>99.4</td><td>428</td><td>2.14</td><td>2.2</td></tr><tr><td>hard</td><td>reference_checkpoint</td><td>False</td><td>ok</td><td>168.6</td><td>675</td><td>3.38</td><td>2</td></tr><tr><td>hard</td><td>reference_checkpoint</td><td>True</td><td>ok</td><td>168.5</td><td>675</td><td>3.38</td><td>2</td></tr><tr><td>hard</td><td>reference_compile</td><td>False</td><td>ok</td><td>65.3</td><td>171</td><td>0.86</td><td>1.3</td></tr><tr><td>hard</td><td>reference_compile</td><td>True</td><td>ok</td><td>65.6</td><td>171</td><td>0.86</td><td>1.3</td></tr><tr><td>soft</td><td>reference</td><td>False</td><td>ok</td><td>180.4</td><td>981</td><td>4.9</td><td>2.7</td></tr><tr><td>soft</td><td>reference</td><td>True</td><td>capture_failed</td><td></td><td></td><td></td><td></td></tr><tr><td>soft</td><td>reference_checkpoint</td><td>False</td><td>ok</td><td>279.2</td><td>1396</td><td>6.98</td><td>2.5</td></tr><tr><td>soft</td><td>reference_checkpoint</td><td>True</td><td>capture_failed</td><td></td><td></td><td></td><td></td></tr><tr><td>soft</td><td>reference_compile</td><td>False</td><td>ok</td><td>38.1</td><td>83</td><td>0.42</td><td>1.1</td></tr><tr><td>soft</td><td>reference_compile</td><td>True</td><td>ok</td><td>38.2</td><td>83</td><td>0.42</td><td>1.1</td></tr></tbody></table></div><figcaption>kits23 (2 x 4 x 128^3), forward + backward. Folder: <code>results/kaggle/fb8ebdca9b33-run-sprint2/results/20261025T195519Z-baseline-paper/</code>. <span class="src">results/kaggle/fb8ebdca9b33-run-sprint2/results/20261025T195519Z-baseline-paper/rows.parquet</span></figcaption></figure>
+<p>How to read it:</p>
+<ul>
+<li><strong>Original, hard</strong>: 428 kernels -&gt; launch floor 2.1 ms, measured 99.4 ms. Launches
+  are ~2% of the time: <strong>GPU-bound</strong>. With a CUDA graph: 99.4 ms, identical. Test 2
+  confirms Test 1: there was nothing for the graph to remove.</li>
+<li><strong>Original + compile, hard</strong>: 171 kernels, 65 ms. Fewer launches <em>and</em> faster, but
+  the launches saved (~1.3 ms) cannot explain 34 ms: the gain is fused, cheaper GPU
+  work. Still GPU-bound, still dominated by the atomic scatters.</li>
+<li><strong>Original, soft, graph = <code>capture_failed</code></strong>: the soft path builds a tensor with
+  <code>torch.tensor(..., device="cuda")</code> in every call, a host-to-device copy, which a
+  graph cannot contain. That is the <strong>sync-bound</strong> pattern (here harmless for speed, but
+  it blocks graphs). Our versions contain no such copy; a test enforces it:</li>
+</ul>
+<figure class="walk"><div class="code-head"><span class="path">walk-through: tests/test_sync.py:28-50</span><a href="https://github.com/kapitan05/ace-kernels/blob/1ae681f14fba3a99015fbf64bfc5158a585fdc97/tests/test_sync.py#L28-L50" target="_blank" rel="noopener">GitHub</a></div><div class="step"><div class="step-code"><div class="highlight"><pre><span></span><span class="linenos">28</span><span class="nd">@pytest</span><span class="o">.</span><span class="n">mark</span><span class="o">.</span><span class="n">parametrize</span><span class="p">(</span><span class="s2">"binning"</span><span class="p">,</span> <span class="p">[</span><span class="s2">"hard"</span><span class="p">,</span> <span class="s2">"soft"</span><span class="p">])</span>
+<span class="linenos">29</span><span class="nd">@pytest</span><span class="o">.</span><span class="n">mark</span><span class="o">.</span><span class="n">parametrize</span><span class="p">(</span><span class="s2">"include_background"</span><span class="p">,</span> <span class="p">[</span><span class="kc">True</span><span class="p">,</span> <span class="kc">False</span><span class="p">])</span>
+<span class="linenos">30</span><span class="k">def</span><span class="w"> </span><span class="nf">test_has_no_host_sync</span><span class="p">(</span>
+<span class="linenos">31</span>    <span class="n">impl</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">binning</span><span class="p">:</span> <span class="n">Binning</span><span class="p">,</span> <span class="n">include_background</span><span class="p">:</span> <span class="nb">bool</span>
+<span class="linenos">32</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos">33</span>    <span class="n">skip_unless_supported</span><span class="p">(</span><span class="n">impl</span><span class="p">,</span> <span class="n">binning</span><span class="p">,</span> <span class="s2">"cuda"</span><span class="p">,</span> <span class="s2">"paper-3d-hard"</span><span class="p">)</span>
+<span class="linenos">34</span>    <span class="n">config</span> <span class="o">=</span> <span class="n">ACEConfig</span><span class="o">.</span><span class="n">model_validate</span><span class="p">(</span>
+<span class="linenos">35</span>        <span class="p">{</span>
+<span class="linenos">36</span>            <span class="s2">"binning"</span><span class="p">:</span> <span class="n">binning</span><span class="p">,</span>
+<span class="linenos">37</span>            <span class="s2">"to_onehot_y"</span><span class="p">:</span> <span class="kc">True</span><span class="p">,</span>
+<span class="linenos">38</span>            <span class="s2">"include_background"</span><span class="p">:</span> <span class="n">include_background</span><span class="p">,</span>
+<span class="linenos">39</span>            <span class="s2">"weight"</span><span class="p">:</span> <span class="p">(</span><span class="mf">1.0</span><span class="p">,</span> <span class="mf">2.0</span><span class="p">,</span> <span class="mf">0.5</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">)</span> <span class="k">if</span> <span class="n">include_background</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
+<span class="linenos">40</span>        <span class="p">}</span>
+<span class="linenos">41</span>    <span class="p">)</span>
+<span class="linenos">42</span>    <span class="n">x</span><span class="p">,</span> <span class="n">y</span> <span class="o">=</span> <span class="n">make_inputs</span><span class="p">(</span><span class="n">InputSpec</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="p">(</span><span class="mi">16</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">16</span><span class="p">)),</span> <span class="n">config</span><span class="p">,</span> <span class="s2">"cuda"</span><span class="p">)</span>
+<span class="linenos">43</span>    <span class="n">x</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+</pre></div>
+</div><div class="step-note"><p>Runs for every graph-safe implementation (all ours), both binnings, with and without background and class weights.</p></div></div><div class="step"><div class="step-code"><div class="highlight"><pre><span></span><span class="linenos">44</span>    <span class="n">ace_loss</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">y</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">impl</span><span class="o">=</span><span class="n">impl</span><span class="p">)</span>  <span class="c1"># warm up lazy init outside the check</span>
+<span class="linenos">45</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+</pre></div>
+</div><div class="step-note"><p>One call first: legitimate one-time work (Triton compilation, cached tables) happens here, outside the check.</p></div></div><div class="step"><div class="step-code"><div class="highlight"><pre><span></span><span class="linenos">46</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">set_sync_debug_mode</span><span class="p">(</span><span class="s2">"error"</span><span class="p">)</span>
+<span class="linenos">47</span>    <span class="k">try</span><span class="p">:</span>
+<span class="linenos">48</span>        <span class="n">loss</span> <span class="o">=</span> <span class="n">ace_loss</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">y</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">impl</span><span class="o">=</span><span class="n">impl</span><span class="p">)</span>
+<span class="linenos">49</span>        <span class="p">(</span><span class="n">grad</span><span class="p">,)</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">grad</span><span class="p">(</span><span class="n">loss</span><span class="p">,</span> <span class="n">x</span><span class="p">)</span>
+<span class="linenos">50</span>    <span class="k">finally</span><span class="p">:</span>
+</pre></div>
+</div><div class="step-note"><p><strong>The check</strong>: in this mode PyTorch raises an error on <em>any</em> operation that makes the CPU wait for the GPU (<code>.item()</code>, <code>.cpu()</code>, a blocking copy). Forward and backward must complete without one.</p></div></div></figure>
+<h3 id="test-3-the-timeline">Test 3: the timeline</h3>
+<p>The profiler records when the CPU issued each launch and when the GPU ran each
+kernel (Sprint 2 and Sprint 11 profiles, <code>results/kaggle/&lt;commit&gt;/results/profile/*/trace.json</code>):</p>
+<figure class="plot"><img src="assets/plots/docs_study_assets_figures_timeline.png" alt="One forward + backward step of the original and of ours (kits23, hard): top row of each panel = CPU launch calls, bottom row = GPU execution" loading="lazy"><figcaption>One forward + backward step of the original and of ours (kits23, hard): top row of each panel = CPU launch calls, bottom row = GPU execution <span class="src">docs/study/assets/figures/timeline.png</span></figcaption><p class="proves"><b>Proves:</b> the original is GPU-bound: the CPU has issued all ~430 launches after ~15 ms and waits, while the GPU runs gap-free for 100 ms, mostly in scatter kernels (orange). Ours does the same work in 7 GPU operations and 3.6 ms; its one visible gap (~0.17 ms) is the CPU preparing a Triton launch: launch overhead, small here but dominant on small inputs (Test 4).</p></figure>
+<p>To see it yourself, drag <code>results/kaggle/fb8ebdca9b33-run-sprint2/results/profile/reference-hard-kits23-fwd_bwd/trace.json</code>
+into <a href="https://ui.perfetto.dev">ui.perfetto.dev</a>.</p>
+<h3 id="test-4-shrink-the-input">Test 4: shrink the input</h3>
+<p>GPU work shrinks with the data; launch cost does not. So as the input gets smaller, a
+GPU-bound call gets faster, and a launch-bound call stops getting faster at its
+launch floor. Sprint 11 measured the four deep-supervision sizes of the paper's network
+(experiment <code>sprint11-deepsup</code>, config <code>bench/configs/sprint11_deepsup.yaml</code>):</p>
+<figure class="table"><div class="scroll"><table><thead><tr><th>shape</th><th>impl</th><th>run</th><th>ms</th><th>kernels_per_call</th><th>launch floor ms</th></tr></thead><tbody><tr><td>ds0-128</td><td>reference</td><td>eager</td><td>47.5</td><td>232</td><td>1.16</td></tr><tr><td>ds0-128</td><td>reference</td><td>graph</td><td>47.5</td><td>232</td><td>1.16</td></tr><tr><td>ds1-64</td><td>reference</td><td>eager</td><td>7.04</td><td>232</td><td>1.16</td></tr><tr><td>ds1-64</td><td>reference</td><td>graph</td><td>6.18</td><td>232</td><td>1.16</td></tr><tr><td>ds2-32</td><td>reference</td><td>eager</td><td>3.89</td><td>231</td><td>1.16</td></tr><tr><td>ds2-32</td><td>reference</td><td>graph</td><td>2.14</td><td>231</td><td>1.16</td></tr><tr><td>ds3-16</td><td>reference</td><td>eager</td><td>3.73</td><td>231</td><td>1.16</td></tr><tr><td>ds3-16</td><td>reference</td><td>graph</td><td>1.23</td><td>231</td><td>1.16</td></tr><tr><td>ds0-128</td><td>v5_triton</td><td>eager</td><td>1.85</td><td>55</td><td>0.275</td></tr><tr><td>ds0-128</td><td>v5_triton</td><td>graph</td><td>1.86</td><td>55</td><td>0.275</td></tr><tr><td>ds1-64</td><td>v5_triton</td><td>eager</td><td>0.87</td><td>55</td><td>0.275</td></tr><tr><td>ds1-64</td><td>v5_triton</td><td>graph</td><td>0.342</td><td>55</td><td>0.275</td></tr><tr><td>ds2-32</td><td>v5_triton</td><td>eager</td><td>0.854</td><td>55</td><td>0.275</td></tr><tr><td>ds2-32</td><td>v5_triton</td><td>graph</td><td>0.162</td><td>55</td><td>0.275</td></tr><tr><td>ds3-16</td><td>v5_triton</td><td>eager</td><td>0.889</td><td>55</td><td>0.275</td></tr><tr><td>ds3-16</td><td>v5_triton</td><td>graph</td><td>0.145</td><td>55</td><td>0.275</td></tr><tr><td>ds0-128</td><td>v6_triton</td><td>eager</td><td>1.61</td><td>7</td><td>0.035</td></tr><tr><td>ds0-128</td><td>v6_triton</td><td>graph</td><td>1.68</td><td>7</td><td>0.035</td></tr><tr><td>ds1-64</td><td>v6_triton</td><td>eager</td><td>0.207</td><td>7</td><td>0.035</td></tr><tr><td>ds1-64</td><td>v6_triton</td><td>graph</td><td>0.204</td><td>7</td><td>0.035</td></tr><tr><td>ds2-32</td><td>v6_triton</td><td>eager</td><td>0.051</td><td>7</td><td>0.035</td></tr><tr><td>ds2-32</td><td>v6_triton</td><td>graph</td><td>0.051</td><td>7</td><td>0.035</td></tr><tr><td>ds3-16</td><td>v6_triton</td><td>eager</td><td>0.034</td><td>7</td><td>0.035</td></tr><tr><td>ds3-16</td><td>v6_triton</td><td>graph</td><td>0.034</td><td>7</td><td>0.035</td></tr></tbody></table></div><figcaption>Hard binning, B=1, C=4, Tesla T4. Folder: <code>results/kaggle/60a3c6df2c3c-run-sprint11/results/20261027T144629Z-sprint11-deepsup/</code>. <span class="src">results/kaggle/60a3c6df2c3c-run-sprint11/results/20261027T144629Z-sprint11-deepsup/rows.parquet</span></figcaption></figure>
+<ul>
+<li><strong>Original at 128^3</strong>: 47.5 ms with or without a graph: GPU-bound.</li>
+<li><strong>Original at 16^3</strong>: 3.7 ms eager, 1.2 ms in a graph: <strong>the same code is
+  launch-bound at small sizes</strong> (~230 launches at batch 1; the graph removes their
+  CPU cost and lands at the launch floor, 1.16 ms).</li>
+<li><strong>v5 (Sprint 8)</strong>: ~0.85-0.9 ms from 64^3 down to 16^3, flat, and a graph cuts
+  it to 0.15 ms: launch-bound (~55 launches). This finding led to Sprint 11's fused
+  epilogue: <strong>v6</strong> has 7 launches and falls to 0.034 ms at 16^3, with or without a graph.</li>
+</ul>
+<figure class="plot"><img src="assets/plots/docs_study_assets_figures_scaling.png" alt="Time vs volume (log-log); dotted = each implementation's launch floor" loading="lazy"><figcaption>Time vs volume (log-log); dotted = each implementation's launch floor <span class="src">docs/study/assets/figures/scaling.png</span></figcaption><p class="proves"><b>Proves:</b> flat = launch-bound, rising with volume = GPU-bound. The original flattens below 64^3; v5 is flat across the small sizes; v6 keeps scaling down to its floor.</p></figure>
+<h3 id="the-diagnosis-in-one-table">The diagnosis in one table</h3>
+<table>
+<thead>
+<tr>
+<th>implementation</th>
+<th>training size (128^3)</th>
+<th>small (16^3)</th>
+<th>fixed by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>original</td>
+<td>GPU-bound (atomic contention)</td>
+<td>launch-bound (~230 launches per call at B=1)</td>
+<td>privatized histograms (S5), fusion (S6-S8)</td>
+</tr>
+<tr>
+<td>original, soft</td>
+<td>+ a host-to-device copy per call (blocks graphs)</td>
+<td></td>
+<td>no copies in our versions (S3+)</td>
+</tr>
+<tr>
+<td>v5</td>
+<td>GPU-bound (histogram kernel)</td>
+<td>launch-bound (~55 launches)</td>
+<td>one-launch epilogue (S11)</td>
+</tr>
+<tr>
+<td>v6</td>
+<td>GPU-bound (histogram reduction: the remaining gap)</td>
+<td>near its launch floor (7 launches)</td>
+<td>next: the reduction (RTX PRO 6000)</td>
+</tr>
+</tbody>
+</table>
+<details class="check"><summary>Self-check: torch.compile made the original soft loss 4.7x faster. Does that mean it was launch-bound?</summary><div class="answer">No. Its launches cost ~5 ms of 184 ms. Compile fused a long chain of elementwise ops on voxel-sized temporaries, so the GPU moved far fewer bytes: a GPU (memory) win. The CUDA-graph test is the clean check for launch overhead.</div></details>
+<details class="check"><summary>Self-check: The same code is GPU-bound at 128^3 and launch-bound at 16^3. How?</summary><div class="answer">Launch cost is fixed per kernel (~5 us x kernels); GPU work scales with the data. At 16^3 the data is 512x smaller, the GPU work drops below the launch cost, and the launches dominate.</div></details>
+<details class="check"><summary>Self-check: Which two numbers in a benchmark row tell you the regime without any profiler?</summary><div class="answer"><code>p50_ms</code> and <code>launch_floor_ms</code> (= kernels_per_call x 5 us). Within a few x: launch-bound (the floor is optimistic). Tens of x apart: GPU-bound. Confirm with the graphed row: a launch-bound call drops to about the floor.</div></details>
 <h2 id="how-speed-is-measured-preview-of-page-7">How speed is measured (preview of page 7)</h2>
 <p>GPU work is asynchronous: Python returns before the GPU finishes, so wall-clock timing
 is wrong. The harness records CUDA events around each call, synchronizes, flushes the
 L2 cache before each repetition (so data is read from DRAM as in training) and reports
 the median of 10+ repetitions:</p>
-<figure class="walk"><div class="code-head"><span class="path">walk-through: src/ace_bench/timing.py:48-77</span><a href="https://github.com/kapitan05/ace-kernels/blob/089df3e03805da8196e93d3acba6b27bcfe9ac58/src/ace_bench/timing.py#L48-L77" target="_blank" rel="noopener">GitHub</a></div><div class="step"><div class="step-code"><div class="highlight"><pre><span></span><span class="linenos">48</span><span class="k">def</span><span class="w"> </span><span class="nf">measure</span><span class="p">(</span>
+<figure class="walk"><div class="code-head"><span class="path">walk-through: src/ace_bench/timing.py:48-77</span><a href="https://github.com/kapitan05/ace-kernels/blob/1ae681f14fba3a99015fbf64bfc5158a585fdc97/src/ace_bench/timing.py#L48-L77" target="_blank" rel="noopener">GitHub</a></div><div class="step"><div class="step-code"><div class="highlight"><pre><span></span><span class="linenos">48</span><span class="k">def</span><span class="w"> </span><span class="nf">measure</span><span class="p">(</span>
 <span class="linenos">49</span>    <span class="n">fn</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[],</span> <span class="nb">object</span><span class="p">],</span>
 <span class="linenos">50</span>    <span class="n">device</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
 <span class="linenos">51</span>    <span class="n">warmup</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">5</span><span class="p">,</span>
